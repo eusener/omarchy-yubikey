@@ -138,13 +138,23 @@ Item {
     }
   }
 
-  JsonReader { id: statusReader;    argv: ["status"];      sink: function(d) { root.status = d; root.errorText = "" } }
+  // A terminal command is holding the key (see TERM_LOCK in the backend). Keep
+  // what is on screen and keep asking until it lets go, however long the PIN
+  // prompt takes.
+  function keyBusy(d) {
+    if (!d || !d.busy) return false
+    termRefresh.ticks = 0
+    if (!termRefresh.running) termRefresh.restart()
+    return true
+  }
+
+  JsonReader { id: statusReader;    argv: ["status"];      sink: function(d) { if (root.keyBusy(d)) return; root.status = d; root.errorText = "" } }
   JsonReader { id: depsReader;      argv: ["deps"];        sink: function(d) { root.deps = d } }
   JsonReader { id: pamReader;       argv: ["pam-status"];  sink: function(d) { root.pam = d } }
   JsonReader { id: sshReader;       argv: ["ssh-status"];  sink: function(d) { root.ssh = d } }
-  JsonReader { id: sshKeysReader;   argv: ["ssh-keys"];    sink: function(d) { root.sshKeys = d; root.clampCursor() } }
+  JsonReader { id: sshKeysReader;   argv: ["ssh-keys"];    sink: function(d) { if (root.keyBusy(d)) return; root.sshKeys = d; root.clampCursor() } }
   JsonReader { id: luksReader;      argv: ["luks-status"]; sink: function(d) { root.luks = d } }
-  JsonReader { id: oathReader;      argv: ["oath-list"];   sink: function(d) { root.oath = d; root.clampCursor() } }
+  JsonReader { id: oathReader;      argv: ["oath-list"];   sink: function(d) { if (root.keyBusy(d)) return; root.oath = d; root.clampCursor() } }
   JsonReader { id: providersReader; argv: ["providers"];   sink: function(d) { root.providers = d } }
 
   function reloadAll() {

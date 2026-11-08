@@ -42,6 +42,27 @@ jbool() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
 # reader here tolerates that and reports absence rather than failing.
 yk() { ykman "$@" 2>/dev/null; }
 
+# A terminal command holding the key. The FIDO2 applet speaks CTAPHID, which
+# allows one conversation at a time: a background `ykman fido info` landing
+# while `ykman` waits on a PIN breaks the waiting one with "Wrong channel".
+# `term` records its PID here for as long as the command runs, and every read
+# that touches the key answers {"busy":true} instead — the panel keeps what it
+# had and asks again later.
+TERM_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-yubikey-term.lock"
+
+key_busy() {
+  local pid
+  [[ -r $TERM_LOCK ]] || return 1
+  pid=$(<"$TERM_LOCK")
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && return 0
+  rm -f "$TERM_LOCK"
+  return 1
+}
+
+busy_or_continue() {
+  if key_busy; then echo '{"busy":true}'; exit 0; fi
+}
+
 require_ykman() {
   has ykman || die "ykman is not installed. Run: omarchy-yubikey install-deps"
 }
@@ -243,6 +264,7 @@ cmd_present() {
 }
 
 cmd_status() {
+  busy_or_continue
   if ! has ykman; then
     jq -n '{present:false, count:0, devices:[], pins:{}, pivSlots:[], missingTool:true}'
     return 0
@@ -495,6 +517,7 @@ cmd_ssh_status() {
 #            the real listing, in a terminal. Non-resident keys are not stored
 #            on the key at all and cannot be listed by anything.
 cmd_ssh_keys() {
+  busy_or_continue
   local piv="[]" module pivReadable=false
   module=$(pkcs11_module) || module=""
   if [[ -n $module ]] && has ssh-keygen; then
@@ -545,8 +568,25 @@ cmd_ssh_sk_list() {
   echo "You will be asked for the FIDO2 PIN. Non-resident keys are not stored on"
   echo "the key, so they never appear here — only their handles in ~/.ssh do."
   echo
-  local csv
-  csv=$(ykman fido credentials list --csv) || die "could not list credentials (wrong PIN, or no FIDO2 PIN set)"
+  # stderr is copied rather than captured, so the PIN prompt still reaches the
+  # terminal and the failure can still be told apart afterwards.
+  local csv err; err=$(mktemp)
+  if ! csv=$(ykman fido credentials list --csv 2> >(tee "$err" >&2)); then
+    sleep 0.2  # let tee finish writing
+    local why="could not list credentials"
+    if grep -qiE 'wrong channel|ConnectionFailure|busy' "$err"; then
+      why="another program talked to the key mid-request. Close anything else using it and try again"
+    elif grep -qiE 'PIN_INVALID|wrong pin|invalid pin' "$err"; then
+      why="wrong PIN. Check the retry counter on the Device page before trying again"
+    elif grep -qiE 'PIN_NOT_SET|no pin|not set' "$err"; then
+      why="no FIDO2 PIN is set. Set one on the Device page first"
+    elif grep -qiE 'PIN_BLOCKED|blocked' "$err"; then
+      why="the FIDO2 PIN is blocked. Only a FIDO2 reset recovers the applet"
+    fi
+    rm -f "$err"
+    die "$why"
+  fi
+  rm -f "$err"
   # Passkeys for websites share this storage; SSH keys are the ones whose
   # relying party starts with ssh:. The column is found by its header rather
   # than its position, which has moved between ykman releases.
@@ -714,6 +754,7 @@ cmd_luks_enroll() {
 # enrolled once and read from the panel forever after.
 
 cmd_oath_list() {
+  busy_or_continue
   if ! has ykman; then
     jq -n '{locked:false, accounts:[], error:"ykman is not installed."}'
     return 0
@@ -971,8 +1012,13 @@ cmd_doctor() {
 cmd_term() {
   [[ $# -gt 0 ]] || die "term: need a subcommand"
   has xdg-terminal-exec || die "xdg-terminal-exec not found"
+  # The lock path is baked into the script rather than passed through the
+  # environment, which a terminal started by a server process may not inherit.
+  # The pause lets a panel read already in flight finish before the command
+  # starts talking to the key.
+  local lock; lock=$(printf '%q' "$TERM_LOCK")
   exec xdg-terminal-exec -- bash -c \
-    'clear; "$0" "$@"; status=$?; echo; if [[ $status -ne 0 ]]; then echo -e "\e[31mFinished with errors.\e[0m"; fi; read -n1 -r -p "Press any key to close..."' \
+    "clear; echo \$\$ >$lock; sleep 1; \"\$0\" \"\$@\"; status=\$?; rm -f $lock; echo; "'if [[ $status -ne 0 ]]; then echo -e "\e[31mFinished with errors.\e[0m"; fi; read -n1 -r -p "Press any key to close..."' \
     "$SELF" "$@"
 }
 
