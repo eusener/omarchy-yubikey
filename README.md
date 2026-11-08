@@ -147,6 +147,24 @@ identity. Switching it on writes `enable-ssh-support` to `~/.gnupg/gpg-agent.con
 and `SSH_AUTH_SOCK` to `~/.config/environment.d/`; it takes effect at the next
 login, since that is when the session environment is built.
 
+#### What is already on the key
+
+The top of the SSH section lists the SSH identities the key holds right now,
+as far as each applet allows without a PIN:
+
+| Kind | Listed | PIN |
+|---|---|---|
+| PIV | Every slot keypair, with its full public key — click to copy | No |
+| OpenPGP | The authentication subkey; its SSH form when gpg has the public half | No |
+| FIDO2 resident | RP ID and user, filtered from website passkeys | Yes — opens a terminal |
+| FIDO2 non-resident | Nothing. Only the handle in `~/.ssh` exists | — |
+
+PIV and OpenPGP keys are read whenever the page opens. The PIV attestation key
+in slot `f9` is left out, since it signs certificates rather than logins.
+Listing FIDO2 resident credentials needs the FIDO2 PIN, so **List resident
+FIDO2 SSH keys** asks for it in a terminal; the row itself shows how many
+resident slots are still free, which `ykman` reports without one.
+
 ### Disk encryption
 
 If the machine has a LUKS volume, one button enrolls the key as a FIDO2 unlock
@@ -235,6 +253,7 @@ bin/omarchy-yubikey status            # devices, applets, PIN retries as JSON
 bin/omarchy-yubikey pam-status        # which stacks have pam_u2f
 bin/omarchy-yubikey oath-code Google:me@gmail.com
 bin/omarchy-yubikey ssh-sk ed25519-sk resident
+bin/omarchy-yubikey ssh-keys          # SSH public keys on the key, no PIN
 bin/omarchy-yubikey --help            # the rest
 ```
 

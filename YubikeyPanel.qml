@@ -73,6 +73,7 @@ Item {
   property var deps: ({ deps: [], missing: 0, pcscdRunning: false })
   property var pam: ({ services: [], registered: false, keyCount: 0, authfile: "/etc/fido2/fido2" })
   property var ssh: ({ skKeys: [], pkcs11Module: "", gpgSshEnabled: false })
+  property var sshKeys: ({ piv: { readable: false, keys: [] }, openpgp: { present: false }, fido: { residentSlotsRemaining: null } })
   property var luks: ({ devices: [], hasCryptenroll: false })
   property var oath: ({ locked: false, accounts: [], error: "" })
   property var providers: []
@@ -141,6 +142,7 @@ Item {
   JsonReader { id: depsReader;      argv: ["deps"];        sink: function(d) { root.deps = d } }
   JsonReader { id: pamReader;       argv: ["pam-status"];  sink: function(d) { root.pam = d } }
   JsonReader { id: sshReader;       argv: ["ssh-status"];  sink: function(d) { root.ssh = d } }
+  JsonReader { id: sshKeysReader;   argv: ["ssh-keys"];    sink: function(d) { root.sshKeys = d; root.clampCursor() } }
   JsonReader { id: luksReader;      argv: ["luks-status"]; sink: function(d) { root.luks = d } }
   JsonReader { id: oathReader;      argv: ["oath-list"];   sink: function(d) { root.oath = d; root.clampCursor() } }
   JsonReader { id: providersReader; argv: ["providers"];   sink: function(d) { root.providers = d } }
@@ -154,6 +156,7 @@ Item {
     depsReader.running = true
     pamReader.running = true
     sshReader.running = true
+    sshKeysReader.running = true
     luksReader.running = true
     oathReader.running = true
     if (!providers || providers.length === 0) providersReader.running = true
@@ -227,7 +230,9 @@ Item {
       s.push("pam-register")
       var svcs = (pam && pam.services) ? pam.services : []
       for (var j = 0; j < svcs.length; j++) s.push("pam:" + svcs[j].service)
-      s = s.concat(["ssh-sk", "ssh-sk-plain", "ssh-recover", "ssh-piv", "gpg-ssh"])
+      var onKey = cardSshKeys
+      for (var n = 0; n < onKey.length; n++) s.push("sshkey:" + onKey[n].id)
+      s = s.concat(["ssh-sk-list", "ssh-sk", "ssh-sk-plain", "ssh-recover", "ssh-piv", "gpg-ssh"])
       if (luks && luks.devices && luks.devices.length > 0) s.push("luks-enroll")
       s.push("pam-forget")
     } else if (tab === "accounts") {
@@ -296,6 +301,8 @@ Item {
     if (s === "ssh-sk") { runTerm(["ssh-sk", "ed25519-sk", "resident"]); return }
     if (s === "ssh-sk-plain") { runTerm(["ssh-sk", "ed25519-sk", "nonresident"]); return }
     if (s === "ssh-recover") { runTerm(["ssh-recover"]); return }
+    if (s === "ssh-sk-list") { runTerm(["ssh-sk-list"]); return }
+    if (s.indexOf("sshkey:") === 0) { copySshKey(s.substring(7)); return }
     if (s === "ssh-piv") { runTerm(["ssh-piv"]); return }
     if (s === "gpg-ssh") { run(["gpg-ssh", ssh.gpgSshEnabled ? "off" : "on"], "Switching gpg-agent SSH support"); return }
     if (s === "luks-enroll") { runTerm(["luks-enroll"]); return }
@@ -378,6 +385,36 @@ Item {
     confirm.confirmText = "Delete"
     confirm.action = function() { root.run(["oath-delete", id], "Deleting " + id) }
     confirm.opened = true
+  }
+
+  // PIV and OpenPGP keys flattened into one list for the SSH section. Only the
+  // public half is ever here — it is meant to be pasted into authorized_keys.
+  readonly property var cardSshKeys: {
+    var out = []
+    var piv = (sshKeys && sshKeys.piv && sshKeys.piv.keys) ? sshKeys.piv.keys : []
+    for (var i = 0; i < piv.length; i++)
+      out.push({ id: "piv-" + piv[i].id, source: "PIV", title: piv[i].label,
+                 detail: piv[i].type + "  " + piv[i].fingerprint, key: piv[i].key })
+    var pgp = sshKeys ? sshKeys.openpgp : null
+    if (pgp && pgp.present)
+      out.push({ id: "openpgp-aut", source: "OpenPGP", title: "Authentication subkey",
+                 detail: (pgp.algorithm || "") + (pgp.fingerprint ? "  " + pgp.fingerprint : ""),
+                 key: pgp.key || "" })
+    return out
+  }
+
+  function copySshKey(id) {
+    var k = null
+    for (var i = 0; i < cardSshKeys.length; i++) if (cardSshKeys[i].id === id) k = cardSshKeys[i]
+    if (!k) return
+    if (!k.key) {
+      errorText = "gpg does not have the public half of this key yet. Import it, or run `gpg --card-edit` then `fetch`."
+      return
+    }
+    // A public key in argv is harmless — it is the half meant to be shared.
+    Quickshell.execDetached(["/bin/sh", "-c",
+      "printf '%s\\n' \"$0\" | wl-copy && notify-send -a YubiKey 'SSH public key copied' \"$1\"",
+      k.key, k.source + " · " + k.title])
   }
 
   function openProvider(id) {
@@ -991,6 +1028,67 @@ Item {
                   font.pixelSize: Style.font.caption
                   width: parent.width
                   wrapMode: Text.WordWrap
+                }
+
+                Text {
+                  text: "On the key"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  topPadding: Style.space(4)
+                }
+
+                Text {
+                  text: {
+                    if (!root.keyPresent) return "Plug the key in to see what it holds."
+                    var parts = []
+                    if (root.cardSshKeys.length === 0)
+                      parts.push(root.sshKeys.piv && root.sshKeys.piv.readable
+                        ? "No PIV or OpenPGP SSH key on the key."
+                        : "The PIV applet could not be read — it needs pcscd and a PKCS#11 module.")
+                    parts.push("FIDO2 resident keys need the PIN to list, so they open in a terminal. Non-resident keys are not stored on the key at all.")
+                    return parts.join(" ")
+                  }
+                  color: root.dimmer
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                }
+
+                Repeater {
+                  model: root.cardSshKeys
+                  delegate: ActionRow {
+                    required property var modelData
+                    width: parent.width
+                    section: "sshkey:" + modelData.id
+                    icon: "󰌆"
+                    title: modelData.source + " · " + modelData.title
+                    description: modelData.detail
+                    trailing: modelData.key ? "Copy" : "No public key"
+                    trailingColor: modelData.key ? root.accent : root.dimmer
+                    onActivated: root.copySshKey(modelData.id)
+                  }
+                }
+
+                ActionRow {
+                  width: parent.width
+                  section: "ssh-sk-list"
+                  icon: "󰈙"
+                  title: "List resident FIDO2 SSH keys"
+                  description: "Asks for the FIDO2 PIN in a terminal and shows the SSH credentials stored on the key, separately from website passkeys."
+                  trailing: (root.sshKeys.fido && root.sshKeys.fido.residentSlotsRemaining !== null && root.sshKeys.fido.residentSlotsRemaining !== undefined)
+                    ? root.sshKeys.fido.residentSlotsRemaining + " slots free" : ""
+                  enabledLook: root.keyPresent
+                  onActivated: root.runTerm(["ssh-sk-list"])
+                }
+
+                Text {
+                  text: "Add a new one"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  topPadding: Style.space(4)
                 }
 
                 ActionRow {

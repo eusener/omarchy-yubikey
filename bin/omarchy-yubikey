@@ -474,6 +474,101 @@ cmd_ssh_status() {
       gpgSshEnabled:$gpgSsh, gpgSshSocket:$gpgSock, gpgSshEnvWritten:$envFile}'
 }
 
+# SSH identities that live on the key itself, read without a PIN. What can be
+# listed differs per applet, and the JSON says which is which:
+#
+#   PIV      public objects are readable by anyone, so PKCS#11 hands back the
+#            full public key. The attestation key (slot f9) is filtered out —
+#            libykcs11 exposes it, but it signs certificates, not SSH logins.
+#   OpenPGP  ykman reports whether the AUT slot holds a key. The SSH form of
+#            it comes from gpg, and only when gpg already has the public key;
+#            gpg is only consulted when there is something to find, since
+#            scdaemon can grab the reader away from pcscd.
+#   FIDO2    enumerating resident credentials needs the PIN, so this read only
+#            reports how much discoverable storage is left. `ssh-sk-list` does
+#            the real listing, in a terminal. Non-resident keys are not stored
+#            on the key at all and cannot be listed by anything.
+cmd_ssh_keys() {
+  local piv="[]" module pivReadable=false
+  module=$(pkcs11_module) || module=""
+  if [[ -n $module ]] && has ssh-keygen; then
+    local out
+    if out=$(timeout 10 ssh-keygen -D "$module" 2>/dev/null); then
+      pivReadable=true
+      while read -r type blob comment; do
+        [[ -z $blob ]] && continue
+        [[ $comment == *Attestation* ]] && continue
+        local label="${comment#Public key for }" fp
+        fp=$(ssh-keygen -lf - <<<"$type $blob" 2>/dev/null | awk '{print $2}')
+        piv=$(jq -c --arg type "$type" --arg key "$type $blob" --arg label "${label:-PIV key}" --arg fp "$fp" \
+          '. + [{id:$fp, type:$type, label:$label, fingerprint:$fp, key:$key}]' <<<"$piv")
+      done <<<"$out"
+    fi
+  fi
+
+  local pgpPresent=false pgpAlgo="" pgpFpr="" pgpKey=""
+  if has ykman; then
+    local info
+    if info=$(ykman openpgp keys info aut 2>/dev/null); then
+      pgpPresent=true
+      pgpAlgo=$(field 'Algorithm' "$info")
+      if has gpg; then
+        pgpFpr=$(timeout 10 gpg --card-status --with-colons 2>/dev/null | awk -F: '$1 == "fpr" { print $4 }')
+        [[ -n $pgpFpr ]] && pgpKey=$(gpg --export-ssh-key "${pgpFpr}!" 2>/dev/null)
+      fi
+    fi
+  fi
+
+  local remaining=""
+  has ykman && remaining=$(field 'Credential storage remaining' "$(yk fido info)")
+
+  jq -n \
+    --argjson piv "$piv" --argjson pivReadable "$pivReadable" --arg module "$module" \
+    --argjson pgpPresent "$pgpPresent" --arg pgpAlgo "$pgpAlgo" --arg pgpFpr "$pgpFpr" --arg pgpKey "$pgpKey" \
+    --arg remaining "$remaining" \
+    '{piv: {readable:$pivReadable, module:$module, keys:$piv},
+      openpgp: {present:$pgpPresent, algorithm:$pgpAlgo, fingerprint:$pgpFpr, key:$pgpKey},
+      fido: {residentSlotsRemaining: ($remaining | tonumber? // null)}}'
+}
+
+# Terminal-only: the FIDO2 applet will not enumerate resident credentials
+# without its PIN. ykman prompts for it; nothing here ever sees it.
+cmd_ssh_sk_list() {
+  require_ykman
+  echo -e "\e[32mResident SSH keys on this YubiKey.\e[0m"
+  echo "You will be asked for the FIDO2 PIN. Non-resident keys are not stored on"
+  echo "the key, so they never appear here — only their handles in ~/.ssh do."
+  echo
+  local csv
+  csv=$(ykman fido credentials list --csv) || die "could not list credentials (wrong PIN, or no FIDO2 PIN set)"
+  # Passkeys for websites share this storage; SSH keys are the ones whose
+  # relying party starts with ssh:. The column is found by its header rather
+  # than its position, which has moved between ykman releases.
+  local rows
+  rows=$(awk -F, '
+    NR == 1 { for (i = 1; i <= NF; i++) { h = tolower($i)
+                if (h ~ /rp/ && !rp) rp = i
+                else if (h ~ /user_?name/ && !un) un = i
+                else if (h ~ /display/ && !dn) dn = i }
+              next }
+    rp && $rp ~ /^ssh:/ { printf "  %-24s %s\n", $rp, (un ? $un : "") (dn && $dn != "" && $dn != $un ? " (" $dn ")" : ""); n++; next }
+    NF > 0 { other++ }
+    END { print "#" n + 0 ":" other + 0 }' <<<"$csv")
+  local counts="${rows##*#}" n other
+  rows="${rows%#*}"
+  n=${counts%%:*}; other=${counts##*:}
+  echo
+  if [[ $n -gt 0 ]]; then
+    printf '%s' "$rows"
+    echo
+    echo "$n SSH key(s). 'Recover resident keys' writes their handles into ~/.ssh."
+  else
+    echo "No resident SSH keys on this key."
+  fi
+  [[ $other -gt 0 ]] && echo "($other other credential(s) on the key are website passkeys, not SSH.)"
+  return 0
+}
+
 # Terminal-only: ssh-keygen prompts for the FIDO2 PIN and waits for a touch.
 cmd_ssh_sk() {
   local type="${1:-ed25519-sk}" resident="${2:-resident}"
@@ -854,6 +949,11 @@ cmd_doctor() {
     "  FIDO2 keys in ~/.ssh: \(.skKeys | length)",
     "  PKCS#11 module: \(if .pkcs11Module == "" then "none found" else .pkcs11Module end)",
     "  gpg-agent SSH support: \(if .gpgSshEnabled then "on" else "off" end)"'
+  cmd_ssh_keys | jq -r '
+    "  PIV keys on the key: \(if .piv.readable then (.piv.keys | length) else "unreadable" end)",
+    (.piv.keys[] | "    \(.label): \(.fingerprint)"),
+    "  OpenPGP authentication key: \(if .openpgp.present then (.openpgp.algorithm // "present") else "none" end)",
+    "  FIDO2 resident storage left: \(.fido.residentSlotsRemaining // "unknown") (ssh-sk-list for details)"'
   echo
   echo "Accounts"
   echo "--------"
@@ -880,6 +980,7 @@ Reading (JSON on stdout, safe to call from anywhere)
   deps                       Which supporting packages are installed
   pam-status                 pam_u2f state for sudo, polkit, login, lock
   ssh-status                 FIDO2 keys, PKCS#11 module, gpg-agent SSH
+  ssh-keys                   SSH public keys on the key (PIV, OpenPGP) — no PIN
   luks-status                LUKS volumes and their FIDO2 enrollments
   oath-list                  TOTP accounts stored on the key
   providers                  Where to register the key with each service
@@ -891,6 +992,7 @@ System authentication
   pam-register               (prompts) Register this key with PAM
   pam-forget                 (prompts) Remove every registration and stack
   ssh-sk [ed25519-sk|ecdsa-sk] [resident|nonresident]   (prompts)
+  ssh-sk-list                (prompts) List resident FIDO2 SSH keys on the key
   ssh-recover                (prompts) Pull resident SSH keys off the key
   ssh-piv                    Point OpenSSH at the PIV applet over PKCS#11
   gpg-ssh <on|off>           Use gpg-agent as the SSH agent
@@ -925,6 +1027,8 @@ case "${1:-}" in
   pam-forget)   cmd_pam_forget ;;
   _pam-write)   shift; cmd_pam_write "$@" ;;
   ssh-status)   cmd_ssh_status ;;
+  ssh-keys)     cmd_ssh_keys ;;
+  ssh-sk-list)  cmd_ssh_sk_list ;;
   ssh-sk)       shift; cmd_ssh_sk "$@" ;;
   ssh-recover)  cmd_ssh_recover ;;
   ssh-piv)      cmd_ssh_piv ;;
