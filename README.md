@@ -217,8 +217,11 @@ background.
 Adding an account has two paths. **Scan the QR code off the screen** drags a box
 around whatever the provider is showing and reads the `otpauth://` URI straight
 out of it, which beats transcribing base32 by hand. Or type the issuer, account,
-and secret in. Secrets are fed to `ykman` on stdin, never as an argument, so
-they do not appear in the process table.
+and secret in. A secret never appears as a command-line argument, where any
+user on the machine could read it from the process table: the panel hands it
+to the script in the environment (readable only by you), the script feeds it
+to `ykman` on stdin, and QR-code URIs are parsed by the script rather than
+passed to `ykman oath accounts uri`.
 
 Picking an account puts its current code on the clipboard with `wl-copy
 --paste-once`, so a one-time code does not linger for the rest of the session,

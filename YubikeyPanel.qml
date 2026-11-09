@@ -266,8 +266,12 @@ Item {
     }
   }
 
-  function run(argv, describe) {
+  // `env` carries anything that must not appear in a command line (TOTP
+  // secrets): /proc/<pid>/cmdline is world-readable, a process's environment
+  // is readable only by its owner.
+  function run(argv, describe, env) {
     if (!helper || actionProc.running) return
+    actionProc.environment = env || ({})
     actionProc.describe = describe || argv.join(" ")
     busyText = describe || ""
     errorText = ""
@@ -671,8 +675,9 @@ Item {
       errorText = root.t("error.accountIncomplete")
       return
     }
-    run(["oath-add", newIssuer, newName, newSecret, newTouch ? "touch" : "no"],
-        root.t("busy.adding").arg((newIssuer ? newIssuer + ":" : "") + newName))
+    run(["oath-add", newIssuer, newName, "-", newTouch ? "touch" : "no"],
+        root.t("busy.adding").arg((newIssuer ? newIssuer + ":" : "") + newName),
+        { OMARCHY_YUBIKEY_SECRET: newSecret })
     newIssuer = ""; newName = ""; newSecret = ""; newTouch = false
   }
 
