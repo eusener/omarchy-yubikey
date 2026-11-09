@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eusener.yubikey",
   "name": "YubiKey",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Eusener Castilho",
   "description": "YubiKey hardware, system authentication (PAM, SSH, LUKS), and account codes",
   "kinds": [

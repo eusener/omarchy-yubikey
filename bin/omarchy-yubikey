@@ -48,7 +48,14 @@ yk() { ykman "$@" 2>/dev/null; }
 # `term` records its PID here for as long as the command runs, and every read
 # that touches the key answers {"busy":true} instead — the panel keeps what it
 # had and asks again later.
-TERM_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-yubikey-term.lock"
+# XDG_RUNTIME_DIR is per-user and 0700; the fallback stays inside $HOME rather
+# than a predictable name in the world-writable /tmp.
+if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]]; then
+  TERM_LOCK="$XDG_RUNTIME_DIR/omarchy-yubikey-term.lock"
+else
+  mkdir -p "$HOME/.cache" 2>/dev/null
+  TERM_LOCK="$HOME/.cache/omarchy-yubikey-term.lock"
+fi
 
 key_busy() {
   local pid
@@ -431,9 +438,20 @@ cmd_pam_register() {
     # -n omits the username, which is how additional keys are appended to an
     # existing user's line.
     pamu2fcfg -n >"$tmp" || { rm -f "$tmp"; die "registration failed or was cancelled"; }
-    # Append to the existing line rather than adding a second one: pam_u2f
-    # reads one line per user, with credentials separated by colons.
-    sudo sed -i "\$ s|\$|$(tr -d '\n' <"$tmp")|" "$FIDO2_AUTHFILE"
+    # Append to this user's line rather than adding a second one: pam_u2f
+    # reads one line per user, with credentials separated by colons. The new
+    # file is built here and installed whole, so the credential text is never
+    # interpreted by sed, and another user's line is never touched.
+    local cred next
+    cred=$(tr -d '\n' <"$tmp")
+    [[ $cred =~ ^:[A-Za-z0-9+/=,%_.-]+$ ]] || { rm -f "$tmp"; die "pamu2fcfg returned something unexpected; nothing was written"; }
+    next=$(mktemp)
+    awk -v u="$USER" -v c="$cred" -F: '
+      $1 == u && !done { print $0 c; done = 1; next }
+      { print }
+      END { if (!done) print u c }' "$FIDO2_AUTHFILE" >"$next"
+    sudo install -m 0644 "$next" "$FIDO2_AUTHFILE"
+    rm -f "$next"
   fi
   rm -f "$tmp"
 
@@ -816,6 +834,14 @@ cmd_oath_code() {
 cmd_oath_add() {
   require_ykman
   local issuer="$1" name="$2" secret="$3" touch="${4:-no}"
+  # "-" means the secret is in OMARCHY_YUBIKEY_SECRET. The panel uses this so
+  # the secret never sits in a command line, where /proc/<pid>/cmdline shows it
+  # to every user on the machine; a process's environment is readable only by
+  # its owner.
+  if [[ $secret == - ]]; then
+    secret="${OMARCHY_YUBIKEY_SECRET:-}"
+    unset OMARCHY_YUBIKEY_SECRET
+  fi
   [[ -n $name && -n $secret ]] || die "oath-add: need <issuer> <name> <secret> [touch]"
   # ykman prompts before overwriting a name that already exists, and a prompt
   # from the shell process has nobody to answer it — it would hang forever.
@@ -840,12 +866,54 @@ cmd_oath_add() {
   echo "added"
 }
 
-cmd_oath_uri() {
+# Reads an otpauth:// URI on stdin and adds it with the secret on ykman's
+# stdin, so neither the URI nor the secret ever appears as an argument.
+oath_add_uri_stdin() {
   require_ykman
+  local fields
+  fields=$(python3 -I -c '
+import sys, urllib.parse as u
+uri = sys.stdin.readline().strip()
+p = u.urlparse(uri)
+if p.scheme != "otpauth" or p.netloc not in ("totp", "hotp"):
+    sys.exit(2)
+q = {k: v[0] for k, v in u.parse_qs(p.query).items()}
+label = u.unquote(p.path.lstrip("/"))
+issuer, _, name = label.partition(":") if ":" in label else ("", "", label)
+issuer = q.get("issuer", issuer).strip()
+out = [p.netloc, issuer, name.strip(), q.get("secret", "").replace(" ", ""),
+       q.get("digits", ""), q.get("period", ""), q.get("algorithm", "").lower(), q.get("counter", "")]
+if not out[2] or not out[3] or any("\n" in f for f in out):
+    sys.exit(2)
+print("\n".join(out))
+') || die "not a usable otpauth:// URI"
+
+  local type issuer name secret digits period algo counter
+  { read -r type; read -r issuer; read -r name; read -r secret
+    read -r digits; read -r period; read -r algo; read -r counter; } <<<"$fields"
+
+  local existing full="$name"
+  existing=$(ykman oath accounts list 2>/dev/null)
+  [[ -n $issuer ]] && full="$issuer:$name"
+  grep -Fxq "$full" <<<"$existing" && die "'$full' is already on the key. Delete it first if you mean to replace it."
+
+  local args=(oath accounts add -o "$type")
+  [[ -n $issuer ]] && args+=(--issuer "$issuer")
+  [[ $digits =~ ^[678]$ ]] && args+=(--digits "$digits")
+  [[ $period =~ ^[0-9]+$ ]] && args+=(--period "$period")
+  [[ $algo =~ ^sha(1|256|512)$ ]] && args+=(--algorithm "$algo")
+  [[ $type == hotp && $counter =~ ^[0-9]+$ ]] && args+=(--counter "$counter")
+  printf '%s\n' "$secret" | ykman "${args[@]}" "$name" \
+    || die "could not add the account from that URI"
+  echo "added: $full"
+}
+
+# The URI on the command line is the caller's choice; `-` reads it from stdin.
+cmd_oath_uri() {
   local uri="$1"
+  if [[ $uri == - ]]; then oath_add_uri_stdin; return; fi
   [[ $uri == otpauth://* ]] || die "not an otpauth:// URI"
-  ykman oath accounts uri "$uri" || die "could not add the account from that URI"
-  echo "added"
+  printf '%s\n' "$uri" | oath_add_uri_stdin
 }
 
 # Providers show the enrollment secret as a QR code and nothing else. Selecting
@@ -855,12 +923,14 @@ cmd_oath_scan() {
   require_ykman
   for t in grim slurp zbarimg; do has "$t" || die "$t is not installed (needs grim, slurp, and zbar)"; done
   local png uri
-  png=$(mktemp --suffix=.png)
+  # The screenshot holds the secret, so it goes in the per-user runtime dir
+  # when there is one.
+  png=$(mktemp -p "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" --suffix=.png)
   grim -g "$(slurp -d)" "$png" 2>/dev/null || { rm -f "$png"; die "selection cancelled"; }
   uri=$(zbarimg --raw -q "$png" 2>/dev/null | head -1)
   rm -f "$png"
   [[ -n $uri ]] || die "no QR code found in that selection"
-  cmd_oath_uri "$uri"
+  printf '%s\n' "$uri" | oath_add_uri_stdin
 }
 
 cmd_oath_delete() {
@@ -1064,8 +1134,8 @@ System authentication
 
 Accounts
   oath-code   <id>           Generate a TOTP code and copy it
-  oath-add    <issuer> <name> <secret> [touch]
-  oath-uri    <otpauth://…>
+  oath-add    <issuer> <name> <secret|-> [touch]   (- reads OMARCHY_YUBIKEY_SECRET)
+  oath-uri    <otpauth://…|->                    (- reads the URI on stdin)
   oath-scan                  Read an enrollment QR code off the screen
   oath-delete <id>
 
