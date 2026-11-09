@@ -1,6 +1,8 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import qs.Ui
+import qs.Commons
 
 // Whether a YubiKey is plugged in, and a way into the panel.
 //
@@ -16,6 +18,22 @@ BarWidget {
   moduleName: "eusener.yubikey"
 
   property bool present: false
+
+  // Same language choice as the panel: the switch in its header, else the
+  // system language. Only two strings, so they are read straight from the
+  // plugin's catalogs.
+  readonly property string langStateFile: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy-yubikey/language"
+  FileView { id: langFile; path: root.langStateFile; watchChanges: true; printErrors: false; blockLoading: true; onFileChanged: reload() }
+  readonly property string lang: {
+    var c = String(langFile.text() || "").trim()
+    if (c === "en" || c === "pt-BR") return c
+    return String(I18n.language || "").indexOf("pt") === 0 ? "pt-BR" : "en"
+  }
+  FileView { id: catalog; path: String(Qt.resolvedUrl("i18n/" + root.lang + ".json")).replace(/^file:\/\//, ""); printErrors: false; blockLoading: true }
+  function t(key, fallback) {
+    try { var v = JSON.parse(catalog.text() || "{}")[key]; if (typeof v === "string" && v) return v } catch (e) {}
+    return fallback
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -47,7 +65,7 @@ BarWidget {
     // Dimmed rather than hidden: a widget that vanishes when the key comes out
     // reads as a bar glitch, and "no key right now" is worth showing.
     dimmed: !root.present
-    tooltipText: root.present ? "YubiKey connected" : "No YubiKey connected"
+    tooltipText: root.present ? root.t("bar.connected", "YubiKey connected") : root.t("bar.disconnected", "No YubiKey connected")
     onPressed: function(btn) {
       if (!root.bar) return
       root.bar.run("omarchy-shell shell toggle eusener.yubikey '{}'")

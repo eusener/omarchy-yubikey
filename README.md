@@ -52,6 +52,31 @@ whether it is present; one button installs the missing ones through
 QR scanning on the Accounts page also wants `grim`, `slurp`, and `zbar`. The
 first two are already on an Omarchy box.
 
+### Security wizard
+
+The top of **Setup** is a checklist that grades this key and this machine and
+walks through whatever is left, one step at a time. Each step explains why it
+matters and has one button that does it (a terminal opens for anything that
+asks for a PIN or a touch). The checklist re-runs on its own when that terminal
+closes, and the wizard moves on to the next step by itself.
+
+| Level | Steps |
+|---|---|
+| Essential | Tools installed and `pcscd` up · key plugged in · FIDO2 PIN set (and not nearly locked) · PIV PIN, PUK and management key off their factory defaults · no `PKCS11Provider` pointing at an empty PIV applet |
+| Recommended | Key registered with PAM · a backup key registered · a resident FIDO2 SSH key |
+| Optional | sudo by touch · Yubico OTP off (no stray OTP strings in chats) · LUKS unlock |
+
+Steps that do not apply (no LUKS volume, no PIV applet) are not shown. You can
+skip a step, and the skip is remembered in
+`~/.local/state/omarchy-yubikey/wizard-skipped`.
+
+### Language
+
+The switch next to **Refresh** picks between Brazilian Portuguese and US
+English. With no choice saved it follows Omarchy's language. Strings live in
+`i18n/en.json` and `i18n/pt-BR.json`; the choice is saved in
+`~/.local/state/omarchy-yubikey/language`.
+
 ## Device
 
 What the key is and what it can do. Model, serial, firmware, form factor, and
