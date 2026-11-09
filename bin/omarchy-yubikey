@@ -481,7 +481,7 @@ cmd_ssh_status() {
   shopt -s nullglob
   for pub in "$SSH_DIR"/*.pub; do
     local type; type=$(awk '{print $1}' "$pub")
-    [[ $type == *-sk@openssh.com ]] || continue
+    [[ $type == sk-*@openssh.com ]] || continue
     keys=$(jq -c --arg file "$pub" --arg type "$type" \
       --arg comment "$(awk '{ $1=""; $2=""; sub(/^[[:space:]]+/, ""); print }' "$pub")" \
       '. + [{file:$file, type:$type, comment:$comment}]' <<<"$keys")
@@ -494,7 +494,7 @@ cmd_ssh_status() {
   jq -n \
     --argjson keys "$keys" \
     --arg module "$module" \
-    --argjson inSshConfig "$(jbool grep -qi 'PKCS11Provider' "$SSH_DIR/config")" \
+    --argjson inSshConfig "$(jbool grep -qiE '^[[:space:]]*PKCS11Provider' "$SSH_DIR/config")" \
     --argjson gpgSsh "$(jbool grep -qE '^[[:space:]]*enable-ssh-support' "$conf")" \
     --arg gpgSock "$(gpgconf --list-dirs agent-ssh-socket 2>/dev/null)" \
     --argjson envFile "$(jbool test -f "$HOME/.config/environment.d/90-omarchy-yubikey-gpg-ssh.conf")" \
@@ -651,11 +651,12 @@ cmd_ssh_recover() {
 }
 
 cmd_ssh_piv() {
+  [[ ${1:-on} == off ]] && { cmd_ssh_piv_off; return; }
   local module; module=$(pkcs11_module) || die "no PKCS#11 module found. Run: omarchy-yubikey install-deps"
   mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
   local conf="$SSH_DIR/config"
 
-  if ! grep -qi 'PKCS11Provider' "$conf" 2>/dev/null; then
+  if ! grep -qiE '^[[:space:]]*PKCS11Provider' "$conf" 2>/dev/null; then
     {
       echo
       echo "# YubiKey PIV via PKCS#11, added by omarchy-yubikey."
@@ -671,6 +672,17 @@ cmd_ssh_piv() {
   echo
   echo "Public keys currently on the card:"
   ssh-keygen -D "$module" 2>/dev/null || echo "  (none — the PIV slots hold no keypair yet)"
+}
+
+# Comment the provider back out. With no keypair in a PIV slot, the line only
+# makes every connection ask for the PIV PIN and try the attestation key, which
+# cannot sign. A copy of the file is kept next to it.
+cmd_ssh_piv_off() {
+  local conf="$SSH_DIR/config"
+  grep -qiE '^[[:space:]]*PKCS11Provider' "$conf" 2>/dev/null || { echo "No active PKCS11Provider in $conf."; return 0; }
+  cp -p "$conf" "$conf.bak.$(date +%s)"
+  sed -i -E 's/^([[:space:]]*)(PKCS11Provider.*)$/\1# \2  # disabled by omarchy-yubikey/I' "$conf"
+  echo "Commented out PKCS11Provider in $conf (backup saved alongside)."
 }
 
 cmd_gpg_ssh() {
@@ -1046,7 +1058,7 @@ System authentication
   ssh-sk [ed25519-sk|ecdsa-sk] [resident|nonresident]   (prompts)
   ssh-sk-list                (prompts) List resident FIDO2 SSH keys on the key
   ssh-recover                (prompts) Pull resident SSH keys off the key
-  ssh-piv                    Point OpenSSH at the PIV applet over PKCS#11
+  ssh-piv [on|off]           Point OpenSSH at the PIV applet over PKCS#11, or stop
   gpg-ssh <on|off>           Use gpg-agent as the SSH agent
   luks-enroll [device]       (prompts) Unlock a LUKS volume with the key
 
@@ -1083,7 +1095,7 @@ case "${1:-}" in
   ssh-sk-list)  cmd_ssh_sk_list ;;
   ssh-sk)       shift; cmd_ssh_sk "$@" ;;
   ssh-recover)  cmd_ssh_recover ;;
-  ssh-piv)      cmd_ssh_piv ;;
+  ssh-piv)      shift; cmd_ssh_piv "$@" ;;
   gpg-ssh)      shift; cmd_gpg_ssh "$@" ;;
   luks-status)  cmd_luks_status ;;
   luks-enroll)  shift; cmd_luks_enroll "$@" ;;

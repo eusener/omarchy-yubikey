@@ -32,6 +32,11 @@ Item {
 
   function open(payloadJson) {
     closingFromHost = false
+    // `omarchy-shell shell toggle eusener.yubikey '{"tab":"setup"}'` opens on a page.
+    try {
+      var p = JSON.parse(payloadJson || "{}")
+      if (p && ["device", "system", "accounts", "setup"].indexOf(p.tab) >= 0) setTab(p.tab)
+    } catch (e) {}
     window.visible = true
     reloadAll()
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
@@ -56,6 +61,79 @@ Item {
   readonly property color dim: Qt.darker(foreground, 1.4)
   readonly property color dimmer: Qt.darker(foreground, 1.6)
   readonly property string fontFamily: Style.font.family
+
+  // ---- language -----------------------------------------------------------
+  //
+  // The panel ships its own catalogs in i18n/ and picks between them with a
+  // switch in the header, independent of the system language. The choice is
+  // kept outside the plugin directory (which is a git checkout) so updates do
+  // not trip over it; with no choice saved, it follows Setup > Language.
+  readonly property var languages: [
+    { value: "pt-BR", label: "PT-BR", tooltip: root.t("header.language") },
+    { value: "en",    label: "EN-US", tooltip: root.t("header.language") }
+  ]
+  readonly property string langStateFile: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy-yubikey/language"
+  property string langOverride: ""
+  readonly property string savedLang: String(langFile.text() || "").trim()
+  readonly property string lang: {
+    var c = langOverride || savedLang
+    if (c === "en" || c === "pt-BR") return c
+    return String(I18n.language || "").indexOf("pt") === 0 ? "pt-BR" : "en"
+  }
+
+  function setLang(code) {
+    if (code !== "en" && code !== "pt-BR") return
+    langOverride = code
+    Quickshell.execDetached(["/bin/sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && printf '%s\\n' \"$1\" > \"$0\"",
+                             langStateFile, code])
+  }
+
+  function cycleLang(dir) {
+    var i = 0
+    for (var n = 0; n < languages.length; n++) if (languages[n].value === lang) i = n
+    setLang(languages[(i + (dir < 0 ? languages.length - 1 : 1)) % languages.length].value)
+  }
+
+  FileView { id: langFile; path: root.langStateFile; watchChanges: true; printErrors: false; blockLoading: true; onFileChanged: reload() }
+
+  function catalogPath(code) { return String(Qt.resolvedUrl("i18n/" + code + ".json")).replace(/^file:\/\//, "") }
+  FileView { id: enCatalog; path: root.catalogPath("en");    watchChanges: true; printErrors: false; blockLoading: true; onFileChanged: reload() }
+  FileView { id: ptCatalog; path: root.catalogPath("pt-BR"); watchChanges: true; printErrors: false; blockLoading: true; onFileChanged: reload() }
+
+  function parseCatalog(raw) {
+    try { var p = JSON.parse(raw || "{}"); return (p && typeof p === "object" && !Array.isArray(p)) ? p : ({}) }
+    catch (e) { return ({}) }
+  }
+  readonly property var enStrings: parseCatalog(enCatalog.text())
+  readonly property var ptStrings: parseCatalog(ptCatalog.text())
+  readonly property var strings: lang === "pt-BR" ? ptStrings : enStrings
+
+  // Falls back to English, then to the given fallback, then to the key.
+  function t(key, fallback) {
+    var layers = [root.strings, root.enStrings]
+    for (var i = 0; i < layers.length; i++) {
+      var v = layers[i][key]
+      if (v && typeof v === "object") v = v.other
+      if (typeof v === "string" && v.length > 0) return v
+    }
+    return fallback !== undefined ? fallback : key
+  }
+
+  // Plural entries: English "one" is exactly 1; Brazilian Portuguese "one"
+  // covers 0 and 1 (CLDR).
+  function tn(key, count) {
+    var n = Number(count)
+    var layers = [[root.strings, root.lang], [root.enStrings, "en"]]
+    for (var i = 0; i < layers.length; i++) {
+      var v = layers[i][0][key]
+      if (!v) continue
+      if (typeof v === "string") return v
+      var one = layers[i][1] === "pt-BR" ? (n === 0 || n === 1) : n === 1
+      var form = one && v.one ? v.one : v.other
+      if (typeof form === "string" && form.length > 0) return form
+    }
+    return key
+  }
 
   // ---- backend ------------------------------------------------------------
   //
@@ -121,7 +199,7 @@ Item {
     onRunningChanged: if (running) parsedOk = false
     onExited: function(exitCode) {
       if (!parsedOk && exitCode !== 0)
-        root.errorText = "`omarchy-yubikey " + argv.join(" ") + "` failed (exit " + exitCode + ")."
+        root.errorText = root.t("error.command").arg("omarchy-yubikey " + argv.join(" ")).arg(exitCode)
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -159,7 +237,7 @@ Item {
 
   function reloadAll() {
     if (!helper) {
-      errorText = "This panel could not locate its own plugin directory, so the backend cannot be run."
+      errorText = root.t("error.noPluginDir")
       return
     }
     statusReader.running = true
@@ -182,7 +260,7 @@ Item {
     property string describe: ""
     onExited: function(exitCode) {
       root.busyText = ""
-      if (exitCode !== 0) root.errorText = describe + " failed (exit " + exitCode + ")."
+      if (exitCode !== 0) root.errorText = root.t("error.action").arg(describe).arg(exitCode)
       else root.errorText = ""
       root.reloadAll()
     }
@@ -213,6 +291,212 @@ Item {
 
   function openUrl(url) { Quickshell.execDetached(["xdg-open", url]) }
 
+  // ---- security wizard ----------------------------------------------------
+  //
+  // A checklist computed from the same reads every page uses, so it re-grades
+  // itself whenever the panel re-reads — including after a terminal closes.
+  // Each step is one of: ok, todo, warn (done but needs attention), blocked
+  // (waiting on an earlier step), or na (does not apply, so not shown).
+  // Skips are remembered across sessions; nothing else about the wizard is.
+  readonly property string wizardStateFile: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy-yubikey/wizard-skipped"
+  FileView { id: wizardFile; path: root.wizardStateFile; watchChanges: true; printErrors: false; blockLoading: true; onFileChanged: reload() }
+  property var skipOverride: null
+  readonly property var skipped: {
+    if (skipOverride) return skipOverride
+    var out = ({})
+    var lines = String(wizardFile.text() || "").split("\n")
+    for (var i = 0; i < lines.length; i++) if (/^[a-z0-9-]+$/.test(lines[i].trim())) out[lines[i].trim()] = true
+    return out
+  }
+
+  function toggleSkip(id) {
+    var next = ({})
+    for (var k in skipped) if (k !== id) next[k] = true
+    if (!skipped[id]) next[id] = true
+    skipOverride = next
+    wizardSelected = ""
+    Quickshell.execDetached(["/bin/sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && printf '%s' \"$1\" > \"$0\"",
+                             wizardStateFile, Object.keys(next).join("\n") + "\n"])
+  }
+
+  readonly property bool checking: statusReader.running || depsReader.running || pamReader.running
+    || sshReader.running || sshKeysReader.running || luksReader.running
+
+  readonly property var wizardSteps: {
+    var out = []
+    var pins = (status && status.pins) ? status.pins : ({})
+    var fido = pins.fido || null
+    var piv = pins.piv || null
+    var key = keyPresent
+    function add(o) { if (o.state !== "na") out.push(o) }
+
+    // -- essential
+    var depsOk = deps.missing === 0 && deps.pcscdRunning
+    add({ id: "tools", level: "essential", icon: "󰏔",
+          state: depsOk ? "ok" : "todo",
+          title: t("wiz.tools"), why: t("wiz.tools.why"),
+          detail: depsOk ? t("wiz.tools.ok") : (deps.missing > 0 ? t("setup.missingCount").arg(deps.missing) : t("wiz.tools.pcscd")),
+          action: t("wiz.tools.do"), kind: "term", argv: ["install-deps"] })
+
+    add({ id: "key", level: "essential", icon: "󰌆",
+          state: key ? "ok" : "todo",
+          title: t("wiz.key"), why: t("wiz.key.why"),
+          detail: key ? t("wiz.key.ok").arg(device ? (device.name || "YubiKey") : "YubiKey") : t("wiz.key.todo"),
+          action: t("wiz.key.do"), kind: "refresh" })
+
+    var fidoRetries = fido && fido.retries ? Number(fido.retries) : 0
+    add({ id: "fido-pin", level: "essential", icon: "󰯄",
+          state: !key ? "blocked" : (!fido || !fido.set) ? "todo" : (fidoRetries > 0 && fidoRetries <= 3 ? "warn" : "ok"),
+          title: t("wiz.fidoPin"), why: t("wiz.fidoPin.why"),
+          detail: !key ? t("wiz.blocked.key")
+                : (!fido || !fido.set) ? t("wiz.fidoPin.todo")
+                : (fidoRetries > 0 && fidoRetries <= 3) ? t("wiz.fidoPin.warn").arg(fidoRetries)
+                : (fidoRetries > 0 ? tn("pin.triesLeft", fidoRetries).arg(fidoRetries) : t("pin.set")),
+          action: (fido && fido.set) ? t("wiz.changePin") : t("wiz.setPin"), kind: "term", argv: ["pin", "fido2"] })
+
+    var pivHere = !!(piv && piv.present)
+    add({ id: "piv-pin", level: "essential", icon: "󰄀",
+          state: !key ? "blocked" : !pivHere ? "na" : (piv.defaultPin ? "todo" : "ok"),
+          title: t("wiz.pivPin"), why: t("wiz.pivPin.why"),
+          detail: !key ? t("wiz.blocked.key") : (pivHere && piv.defaultPin ? t("wiz.pivPin.todo") : t("wiz.notDefault")),
+          action: t("wiz.changePin"), kind: "term", argv: ["pin", "piv"] })
+    add({ id: "piv-puk", level: "essential", icon: "󰄀",
+          state: !key ? "blocked" : !pivHere ? "na" : (piv.defaultPuk ? "todo" : "ok"),
+          title: t("wiz.pivPuk"), why: t("wiz.pivPuk.why"),
+          detail: !key ? t("wiz.blocked.key") : (pivHere && piv.defaultPuk ? t("wiz.pivPuk.todo") : t("wiz.notDefault")),
+          action: t("wiz.pivPuk.do"), kind: "term", argv: ["pin", "piv-puk"] })
+    add({ id: "piv-mgmt", level: "essential", icon: "󰄀",
+          state: !key ? "blocked" : !pivHere ? "na" : (piv.defaultMgmt ? "todo" : "ok"),
+          title: t("wiz.pivMgmt"), why: t("wiz.pivMgmt.why"),
+          detail: !key ? t("wiz.blocked.key") : (pivHere && piv.defaultMgmt ? t("wiz.pivMgmt.todo") : t("wiz.pivMgmt.ok")),
+          action: t("wiz.pivMgmt.do"), kind: "term", argv: ["pin", "piv-mgmt"] })
+
+    // Only shown when the provider is on; broken when no PIV slot holds a key.
+    var pivKeys = (sshKeys && sshKeys.piv && sshKeys.piv.keys) ? sshKeys.piv.keys.length : 0
+    add({ id: "ssh-config", level: "essential", icon: "󰣀",
+          state: !ssh.pkcs11InSshConfig ? "na" : (pivKeys > 0 ? "ok" : "warn"),
+          title: t("wiz.sshConfig"), why: t("wiz.sshConfig.why"),
+          detail: pivKeys > 0 ? t("wiz.sshConfig.ok") : t("wiz.sshConfig.warn"),
+          action: t("wiz.sshConfig.do"), kind: "run", argv: ["ssh-piv", "off"], busy: t("wiz.sshConfig.busy") })
+
+    // -- recommended
+    var registered = !!pam.registered
+    add({ id: "pam-register", level: "recommended", icon: "󰌆",
+          state: registered ? "ok" : (!key ? "blocked" : "todo"),
+          title: t("wiz.pam"), why: t("wiz.pam.why"),
+          detail: registered ? tn("pam.registeredCount", pam.keyCount).arg(pam.keyCount) : (!key ? t("wiz.blocked.key") : t("wiz.pam.todo")),
+          action: t("wiz.pam.do"), kind: "term", argv: ["pam-register"] })
+    add({ id: "backup", level: "recommended", icon: "󰆓",
+          state: pam.keyCount >= 2 ? "ok" : (!registered ? "blocked" : "todo"),
+          title: t("wiz.backup"), why: t("wiz.backup.why"),
+          detail: pam.keyCount >= 2 ? tn("pam.registeredCount", pam.keyCount).arg(pam.keyCount) : (!registered ? t("wiz.blocked.pam") : t("wiz.backup.todo")),
+          action: t("wiz.backup.do"), kind: "term", argv: ["pam-register"] })
+    var skCount = (ssh.skKeys || []).length
+    var fidoReady = !!(fido && fido.set)
+    add({ id: "ssh-key", level: "recommended", icon: "󰌘",
+          state: skCount > 0 ? "ok" : (!key ? "blocked" : (!fidoReady ? "blocked" : "todo")),
+          title: t("wiz.sshKey"), why: t("wiz.sshKey.why"),
+          detail: skCount > 0 ? tn("ssh.onDisk", skCount).arg(skCount) : (!key ? t("wiz.blocked.key") : (!fidoReady ? t("wiz.blocked.fido") : t("wiz.sshKey.todo"))),
+          action: t("wiz.sshKey.do"), kind: "term", argv: ["ssh-sk", "ed25519-sk", "resident"] })
+
+    // -- optional
+    var sudoSvc = pamService("sudo")
+    add({ id: "sudo", level: "optional", icon: "󰆍",
+          state: !sudoSvc ? "na" : (sudoSvc.enabled ? "ok" : (!registered ? "blocked" : "todo")),
+          title: t("wiz.sudo"), why: t("wiz.sudo.why"),
+          detail: sudoSvc && sudoSvc.enabled ? t("state.on") : (!registered ? t("wiz.blocked.pam") : t("state.off")),
+          action: t("wiz.turnOn"), kind: "pam", argv: ["sudo"] })
+    var otp = null
+    for (var a = 0; a < applets.length; a++) if (applets[a].name === "Yubico OTP") otp = applets[a]
+    add({ id: "otp", level: "optional", icon: "󰌌",
+          state: !key ? "na" : (!otp ? "na" : (otp.enabled ? "todo" : "ok")),
+          title: t("wiz.otp"), why: t("wiz.otp.why"),
+          detail: otp && otp.enabled ? t("state.on") : t("state.off"),
+          action: t("wiz.otp.do"), kind: "applet", argv: ["Yubico OTP"] })
+    var disk = (luks.devices && luks.devices.length > 0) ? luks.devices[0] : null
+    add({ id: "luks", level: "optional", icon: "󰋊",
+          state: !disk || !luks.hasCryptenroll ? "na" : (disk.fido2Tokens > 0 ? "ok" : (!key ? "blocked" : (!fidoReady ? "blocked" : "todo"))),
+          title: t("wiz.luks"), why: t("wiz.luks.why").arg(disk ? disk.device : ""),
+          detail: disk && disk.fido2Tokens > 0 ? t("luks.enrolled") : (!key ? t("wiz.blocked.key") : (!fidoReady ? t("wiz.blocked.fido") : t("wiz.luks.todo"))),
+          action: t("wiz.luks.do"), kind: "term", argv: ["luks-enroll"] })
+
+    for (var n = 0; n < out.length; n++) out[n].skipped = !!skipped[out[n].id] && out[n].state !== "ok"
+    return out
+  }
+
+  function wizardCount(level, doneOnly) {
+    var c = 0
+    for (var i = 0; i < wizardSteps.length; i++) {
+      var s = wizardSteps[i]
+      if (s.level !== level) continue
+      if (!doneOnly || s.state === "ok") c++
+    }
+    return c
+  }
+  readonly property bool essentialsDone: wizardCount("essential", true) === wizardCount("essential", false)
+
+  // The step on screen: the one the user picked, else the first that still
+  // needs doing. A picked step that just turned ok lets go, so finishing a
+  // step moves the wizard forward on its own.
+  property string wizardSelected: ""
+  property string wizardSelectedState: ""
+  function wizardStep(id) {
+    for (var i = 0; i < wizardSteps.length; i++) if (wizardSteps[i].id === id) return wizardSteps[i]
+    return null
+  }
+  readonly property var wizardFirstPending: {
+    for (var i = 0; i < wizardSteps.length; i++) {
+      var s = wizardSteps[i]
+      if ((s.state === "todo" || s.state === "warn") && !s.skipped) return s
+    }
+    return null
+  }
+  readonly property var wizardCurrent: (wizardSelected && wizardStep(wizardSelected)) || wizardFirstPending
+  readonly property int wizardCurrentIndex: {
+    if (!wizardCurrent) return -1
+    for (var i = 0; i < wizardSteps.length; i++) if (wizardSteps[i].id === wizardCurrent.id) return i
+    return -1
+  }
+  onWizardStepsChanged: {
+    var s = wizardSelected ? wizardStep(wizardSelected) : null
+    if (!s) { wizardSelected = ""; return }
+    if (s.state === "ok" && wizardSelectedState !== "ok") wizardSelected = ""
+    else wizardSelectedState = s.state
+  }
+
+  function selectStep(id) {
+    var s = wizardStep(id)
+    wizardSelected = id
+    wizardSelectedState = s ? s.state : ""
+  }
+
+  function runWizardStep(s) {
+    if (!s || s.state === "blocked" || s.state === "ok") return
+    if (s.kind === "term") runTerm(s.argv)
+    else if (s.kind === "run") run(s.argv, s.busy)
+    else if (s.kind === "refresh") reloadAll()
+    else if (s.kind === "pam") togglePam(s.argv[0])
+    else if (s.kind === "applet") toggleApplet(s.argv[0])
+  }
+
+  function wizardStateLabel(s) {
+    if (s.skipped) return t("wiz.state.skipped")
+    return t("wiz.state." + s.state)
+  }
+  function wizardStateColor(s) {
+    if (s.state === "ok") return root.accent
+    if (s.skipped || s.state === "blocked") return root.dimmer
+    if (s.state === "warn" || s.level === "essential") return root.urgent
+    return root.dim
+  }
+  function wizardStateIcon(s) {
+    if (s.state === "ok") return "󰄬"
+    if (s.skipped) return "󰒭"
+    if (s.state === "blocked") return "󰏤"
+    if (s.state === "warn") return "󰀦"
+    return "󰄱"
+  }
+
   // ---- cursor model -------------------------------------------------------
   //
   // One flat list of targets per page, same as the gallery and the stock
@@ -222,14 +506,14 @@ Item {
   property string focusSection: "tabs"
 
   readonly property var tabs: [
-    { value: "device",   label: "Device",   icon: "󰌆" },
-    { value: "system",   label: "System",   icon: "󰌾" },
-    { value: "accounts", label: "Accounts", icon: "󰇮" },
-    { value: "setup",    label: "Setup",    icon: "󰒓" }
+    { value: "device",   label: root.t("tab.device"),   icon: "󰌆" },
+    { value: "system",   label: root.t("tab.system"),   icon: "󰌾" },
+    { value: "accounts", label: root.t("tab.accounts"), icon: "󰇮" },
+    { value: "setup",    label: root.t("tab.setup"),    icon: "󰒓" }
   ]
 
   readonly property var visibleSections: {
-    var s = ["tabs", "refresh"]
+    var s = ["tabs", "lang", "refresh"]
     if (tab === "device") {
       if (keyPresent) {
         for (var i = 0; i < applets.length; i++) s.push("app:" + applets[i].name)
@@ -251,6 +535,9 @@ Item {
       for (var k = 0; k < accts.length; k++) s.push("oath:" + accts[k].id)
       for (var m = 0; m < providers.length; m++) s.push("prov:" + providers[m].id)
     } else {
+      s.push("wiz-run")
+      if (wizardCurrent) s = s.concat(["wiz-do", "wiz-skip"])
+      for (var w = 0; w < wizardSteps.length; w++) s.push("wiz-step:" + wizardSteps[w].id)
       s.push("install-deps")
     }
     return s
@@ -266,6 +553,7 @@ Item {
   // h/l only means something on the tab row; elsewhere it stays a no-op rather
   // than jumping the cursor somewhere the user did not ask for.
   function moveCursorH(dx) {
+    if (focusSection === "lang") { cycleLang(dx); return }
     if (focusSection !== "tabs") return
     var i = 0
     for (var t = 0; t < tabs.length; t++) if (tabs[t].value === tab) i = t
@@ -306,6 +594,7 @@ Item {
   function activateCursor() {
     var s = focusSection
     if (s === "refresh") { reloadAll(); return }
+    if (s === "lang") { cycleLang(1); return }
     if (s === "pam-register") { runTerm(["pam-register"]); return }
     if (s === "pam-forget") { runTerm(["pam-forget"]); return }
     if (s === "ssh-sk") { runTerm(["ssh-sk", "ed25519-sk", "resident"]); return }
@@ -314,9 +603,13 @@ Item {
     if (s === "ssh-sk-list") { runTerm(["ssh-sk-list"]); return }
     if (s.indexOf("sshkey:") === 0) { copySshKey(s.substring(7)); return }
     if (s === "ssh-piv") { runTerm(["ssh-piv"]); return }
-    if (s === "gpg-ssh") { run(["gpg-ssh", ssh.gpgSshEnabled ? "off" : "on"], "Switching gpg-agent SSH support"); return }
+    if (s === "gpg-ssh") { run(["gpg-ssh", ssh.gpgSshEnabled ? "off" : "on"], root.t("busy.gpgSsh")); return }
     if (s === "luks-enroll") { runTerm(["luks-enroll"]); return }
     if (s === "install-deps") { runTerm(["install-deps"]); return }
+    if (s === "wiz-run") { reloadAll(); return }
+    if (s === "wiz-do") { runWizardStep(wizardCurrent); return }
+    if (s === "wiz-skip") { if (wizardCurrent) toggleSkip(wizardCurrent.id); return }
+    if (s.indexOf("wiz-step:") === 0) { selectStep(s.substring(9)); return }
     if (s === "oath-scan") { runTerm(["oath-scan"]); return }
     if (s === "oath-add") { submitAccount(); return }
     if (s === "oath-touch") { newTouch = !newTouch; return }
@@ -343,11 +636,11 @@ Item {
     // a key that PAM has never been introduced to, and quietly fall through
     // forever. Send the user to registration instead of writing the line.
     if (!svc.enabled && !pam.registered) {
-      errorText = "Register the key with PAM first — there is nothing in " + pam.authfile + " to match against."
+      errorText = root.t("error.pamNotRegistered").arg(pam.authfile)
       return
     }
     run([svc.enabled ? "pam-disable" : "pam-enable", name],
-        (svc.enabled ? "Removing " : "Adding ") + "pam_u2f " + (svc.enabled ? "from " : "to ") + name)
+        (svc.enabled ? root.t("busy.pamRemove") : root.t("busy.pamAdd")).arg(name))
   }
 
   function toggleApplet(name) {
@@ -358,12 +651,12 @@ Item {
       // Disabling is the destructive direction: an applet switched off over
       // USB takes every credential on it out of reach until it is switched
       // back on, and switching FIDO2 off can lock the key out of this session.
-      confirm.message = "Disable the " + name + " applet over USB?\n\nAnything relying on it stops working until you turn it back on."
-      confirm.confirmText = "Disable"
-      confirm.action = function() { root.run(["app", name, "off"], "Disabling " + name) }
+      confirm.message = root.t("confirm.disableApplet").arg(name)
+      confirm.confirmText = root.t("confirm.disable")
+      confirm.action = function() { root.run(["app", name, "off"], root.t("busy.disabling").arg(name)) }
       confirm.opened = true
     } else {
-      run(["app", name, "on"], "Enabling " + name)
+      run(["app", name, "on"], root.t("busy.enabling").arg(name))
     }
   }
 
@@ -375,11 +668,11 @@ Item {
 
   function submitAccount() {
     if (newName.length === 0 || newSecret.length === 0) {
-      errorText = "An account needs at least a name and the secret the provider showed you."
+      errorText = root.t("error.accountIncomplete")
       return
     }
     run(["oath-add", newIssuer, newName, newSecret, newTouch ? "touch" : "no"],
-        "Adding " + (newIssuer ? newIssuer + ":" : "") + newName)
+        root.t("busy.adding").arg((newIssuer ? newIssuer + ":" : "") + newName))
     newIssuer = ""; newName = ""; newSecret = ""; newTouch = false
   }
 
@@ -387,13 +680,13 @@ Item {
   // reports that it is waiting, since a touch-protected account can sit here
   // for as long as it takes someone to reach the key.
   function generateCode(id) {
-    run(["oath-code", id], "Reading a code for " + id + " — touch the key if it blinks")
+    run(["oath-code", id], root.t("busy.readingCode").arg(id))
   }
 
   function deleteAccount(id) {
-    confirm.message = "Delete " + id + " from the key?\n\nThe secret is destroyed. Re-adding it needs the original from the provider."
-    confirm.confirmText = "Delete"
-    confirm.action = function() { root.run(["oath-delete", id], "Deleting " + id) }
+    confirm.message = root.t("confirm.deleteAccount").arg(id)
+    confirm.confirmText = root.t("confirm.delete")
+    confirm.action = function() { root.run(["oath-delete", id], root.t("busy.deleting").arg(id)) }
     confirm.opened = true
   }
 
@@ -407,7 +700,7 @@ Item {
                  detail: piv[i].type + "  " + piv[i].fingerprint, key: piv[i].key })
     var pgp = sshKeys ? sshKeys.openpgp : null
     if (pgp && pgp.present)
-      out.push({ id: "openpgp-aut", source: "OpenPGP", title: "Authentication subkey",
+      out.push({ id: "openpgp-aut", source: "OpenPGP", title: root.t("ssh.openpgpSubkey"),
                  detail: (pgp.algorithm || "") + (pgp.fingerprint ? "  " + pgp.fingerprint : ""),
                  key: pgp.key || "" })
     return out
@@ -418,13 +711,13 @@ Item {
     for (var i = 0; i < cardSshKeys.length; i++) if (cardSshKeys[i].id === id) k = cardSshKeys[i]
     if (!k) return
     if (!k.key) {
-      errorText = "gpg does not have the public half of this key yet. Import it, or run `gpg --card-edit` then `fetch`."
+      errorText = root.t("error.noGpgPublic")
       return
     }
     // A public key in argv is harmless — it is the half meant to be shared.
     Quickshell.execDetached(["/bin/sh", "-c",
-      "printf '%s\\n' \"$0\" | wl-copy && notify-send -a YubiKey 'SSH public key copied' \"$1\"",
-      k.key, k.source + " · " + k.title])
+      "printf '%s\\n' \"$0\" | wl-copy && notify-send -a YubiKey \"$2\" \"$1\"",
+      k.key, k.source + " · " + k.title, root.t("notify.sshCopied")])
   }
 
   function openProvider(id) {
@@ -599,7 +892,7 @@ Item {
               }
 
               Column {
-                width: parent.width - 60 - refreshButton.width - Style.space(28)
+                width: parent.width - 60 - langGroup.width - refreshButton.width - Style.space(42)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(3)
 
@@ -612,12 +905,12 @@ Item {
                 }
                 Text {
                   text: {
-                    if (root.toolingMissing) return "Supporting packages are missing — open Setup."
-                    if (!root.keyPresent) return "No key detected. Plug one in, then refresh."
+                    if (root.toolingMissing) return root.t("header.toolingMissing")
+                    if (!root.keyPresent) return root.t("header.noKey")
                     var bits = []
-                    if (root.device.serial) bits.push("Serial " + root.device.serial)
-                    if (root.device.version) bits.push("Firmware " + root.device.version)
-                    if (root.status.count > 1) bits.push(root.status.count + " keys connected")
+                    if (root.device.serial) bits.push(root.t("header.serial").arg(root.device.serial))
+                    if (root.device.version) bits.push(root.t("header.firmware").arg(root.device.version))
+                    if (root.status.count > 1) bits.push(root.tn("header.keysConnected", root.status.count).arg(root.status.count))
                     return bits.join("  ·  ")
                   }
                   color: root.keyPresent ? root.dim : root.urgent
@@ -628,9 +921,30 @@ Item {
                 }
               }
 
+              ButtonGroup {
+                id: langGroup
+                options: root.languages
+                value: root.lang
+                foreground: root.foreground
+                background: root.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                spacing: Style.space(4)
+                focusable: false
+                cursorIndex: {
+                  if (root.focusSection !== "lang") return -1
+                  for (var i = 0; i < root.languages.length; i++) if (root.languages[i].value === root.lang) return i
+                  return -1
+                }
+                anchors.verticalCenter: parent.verticalCenter
+                onChanged: function(v) { root.focusSection = "lang"; root.setLang(v) }
+                onHovered: function(index, isHovered) { if (isHovered) root.focusSection = "lang" }
+              }
+
               Button {
                 id: refreshButton
-                text: "Refresh"
+                text: root.t("header.refresh")
                 iconText: "󰑙"
                 bordered: true
                 foreground: root.foreground
@@ -677,7 +991,7 @@ Item {
                 spacing: Style.space(3)
 
                 Text {
-                  text: root.errorText.length > 0 ? "Something went wrong" : "Working"
+                  text: root.errorText.length > 0 ? root.t("msg.error") : root.t("msg.working")
                   color: root.errorText.length > 0 ? root.urgent : root.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.subtitle
@@ -709,7 +1023,7 @@ Item {
                 visible: !root.keyPresent
 
                 Text {
-                  text: root.toolingMissing ? "The YubiKey tools are not installed yet" : "No YubiKey detected"
+                  text: root.toolingMissing ? root.t("device.toolsMissingTitle") : root.t("device.noKeyTitle")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.title
@@ -717,8 +1031,8 @@ Item {
                 }
                 Text {
                   text: root.toolingMissing
-                    ? "This page reads the key through ykman, which is not on this machine yet. The Setup tab installs it along with everything else the other pages need."
-                    : "Plug the key in and press Refresh. If it is already in, the key may have an applet disabled, or the smartcard daemon may not be running — Setup can tell you which."
+                    ? root.t("device.toolsMissingBody")
+                    : root.t("device.noKeyBody")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -733,7 +1047,7 @@ Item {
                 spacing: Style.space(8)
                 visible: root.keyPresent
 
-                PanelSectionHeader { text: "This key"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("device.thisKey"); foreground: root.foreground; fontFamily: root.fontFamily }
 
                 BorderSurface {
                   width: parent.width
@@ -751,13 +1065,13 @@ Item {
                     anchors.rightMargin: Style.space(14)
                     spacing: Style.space(5)
 
-                    Fact { label: "Model";        value: root.device ? String(root.device.name || "") : "" }
-                    Fact { label: "Serial";       value: root.device ? String(root.device.serial || "") : "" }
-                    Fact { label: "Firmware";     value: root.device ? String(root.device.version || "") : "" }
-                    Fact { label: "Form factor";  value: root.device ? String(root.device.formFactor || "") : "" }
-                    Fact { label: "USB interfaces"; value: root.device ? String(root.device.interfaces || "") : "" }
-                    Fact { label: "NFC";          value: root.device ? (root.device.nfc ? "Enabled" : "Not available") : "" }
-                    Fact { label: "FIPS";         value: (root.device && root.device.fips) ? "Yes" : "" }
+                    Fact { label: root.t("fact.model");        value: root.device ? String(root.device.name || "") : "" }
+                    Fact { label: root.t("fact.serial");       value: root.device ? String(root.device.serial || "") : "" }
+                    Fact { label: root.t("fact.firmware");     value: root.device ? String(root.device.version || "") : "" }
+                    Fact { label: root.t("fact.formFactor");  value: root.device ? String(root.device.formFactor || "") : "" }
+                    Fact { label: root.t("fact.usb"); value: root.device ? String(root.device.interfaces || "") : "" }
+                    Fact { label: "NFC";          value: root.device ? (root.device.nfc ? root.t("fact.enabled") : root.t("fact.notAvailable")) : "" }
+                    Fact { label: "FIPS";         value: (root.device && root.device.fips) ? root.t("fact.yes") : "" }
                   }
                 }
               }
@@ -768,9 +1082,9 @@ Item {
                 spacing: Style.space(8)
                 visible: root.keyPresent
 
-                PanelSectionHeader { text: "Applets"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("applets.title"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "A YubiKey is several independent devices sharing one body. Switching one off over USB hides it from this machine entirely — useful for narrowing what a key exposes, and an easy way to lose access to something if you forget you did it."
+                  text: root.t("applets.intro")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -798,17 +1112,17 @@ Item {
                     title: modelData.name
                     description: {
                       switch (modelData.name) {
-                        case "FIDO2": return "Passkeys, WebAuthn security keys, SSH -sk keys, LUKS unlock"
-                        case "FIDO U2F": return "The older second-factor protocol, still used by some sites"
-                        case "OATH": return "TOTP codes for Gmail, Outlook, AWS — the Accounts tab"
-                        case "PIV": return "Smartcard certificates, usable for SSH over PKCS#11"
-                        case "OpenPGP": return "GPG keys on the card, and gpg-agent as an SSH agent"
-                        case "YubiHSM Auth": return "Credential store for YubiHSM 2 devices"
-                        case "Yubico OTP": return "Yubico OTP and the static-password slots"
+                        case "FIDO2": return root.t("applet.fido2")
+                        case "FIDO U2F": return root.t("applet.u2f")
+                        case "OATH": return root.t("applet.oath")
+                        case "PIV": return root.t("applet.piv")
+                        case "OpenPGP": return root.t("applet.openpgp")
+                        case "YubiHSM Auth": return root.t("applet.hsm")
+                        case "Yubico OTP": return root.t("applet.otp")
                         default: return ""
                       }
                     }
-                    trailing: modelData.enabled ? "Enabled" : "Off"
+                    trailing: modelData.enabled ? root.t("state.enabled") : root.t("state.off")
                     trailingColor: modelData.enabled ? root.accent : root.dimmer
                     onActivated: root.toggleApplet(modelData.name)
                   }
@@ -821,9 +1135,9 @@ Item {
                 spacing: Style.space(8)
                 visible: root.keyPresent
 
-                PanelSectionHeader { text: "PINs"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("pins.title"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "Each applet keeps its own PIN and its own retry counter. Run out of retries and the applet locks; on FIDO2 that means a factory reset and re-registering everywhere. These open a terminal, because a PIN prompt belongs in one."
+                  text: root.t("pins.intro")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -835,15 +1149,15 @@ Item {
                   width: parent.width
                   section: "pin:fido2"
                   icon: "󰯄"
-                  title: (root.status.pins && root.status.pins.fido && root.status.pins.fido.set) ? "Change the FIDO2 PIN" : "Set a FIDO2 PIN"
+                  title: (root.status.pins && root.status.pins.fido && root.status.pins.fido.set) ? root.t("pin.fido2Change") : root.t("pin.fido2Set")
                   description: (root.status.pins && root.status.pins.fido && root.status.pins.fido.set)
-                    ? "Required by passkeys and by SSH keys made with verify-required."
-                    : "Not set yet. Passkeys and verify-required SSH keys need one."
+                    ? root.t("pin.fido2SetDesc")
+                    : root.t("pin.fido2UnsetDesc")
                   trailing: {
                     var f = root.status.pins ? root.status.pins.fido : null
                     if (!f) return ""
-                    if (!f.set) return "Not set"
-                    return f.retries ? f.retries + " tries left" : "Set"
+                    if (!f.set) return root.t("pin.notSet")
+                    return f.retries ? root.tn("pin.triesLeft", f.retries).arg(f.retries) : root.t("pin.set")
                   }
                   trailingColor: (root.status.pins && root.status.pins.fido && root.status.pins.fido.set) ? root.dim : root.urgent
                   enabledLook: root.keyPresent
@@ -854,16 +1168,16 @@ Item {
                   width: parent.width
                   section: "pin:piv"
                   icon: "󰄀"
-                  title: "Change the PIV PIN"
+                  title: root.t("pin.pivChange")
                   description: {
                     var p = root.status.pins ? root.status.pins.piv : null
                     if (p && p.defaultPin)
-                      return "Still on the factory PIN (123456) — anyone with the key in hand can use the slots. Change it before putting anything in one."
-                    return "Guards the smartcard slots."
+                      return root.t("pin.pivDefault")
+                    return root.t("pin.pivDesc")
                   }
                   trailing: {
                     var p = root.status.pins ? root.status.pins.piv : null
-                    return (p && p.retries) ? p.retries + " tries left" : ""
+                    return (p && p.retries) ? root.tn("pin.triesLeft", p.retries).arg(p.retries) : ""
                   }
                   enabledLook: !!(root.status.pins && root.status.pins.piv && root.status.pins.piv.present)
                   onActivated: root.runTerm(["pin", "piv"])
@@ -873,15 +1187,9 @@ Item {
                   text: {
                     var p = root.status.pins ? root.status.pins.piv : null
                     if (!p) return ""
-                    var stale = []
-                    if (p.defaultPuk) stale.push("PUK")
-                    if (p.defaultMgmt) stale.push("management key")
-                    if (stale.length === 0) return ""
-                    return "The PIV " + stale.join(" and the ") + " " + (stale.length > 1 ? "are" : "is")
-                      + " still set to the factory default. Change "
-                      + (stale.length > 1 ? "them" : "it")
-                      + " from a terminal with `omarchy-yubikey pin piv-puk` and `omarchy-yubikey pin piv-mgmt` "
-                      + "before the PIV applet holds anything worth guarding."
+                    if (!p.defaultPuk && !p.defaultMgmt) return ""
+                    if (p.defaultPuk && p.defaultMgmt) return root.t("pin.pivStaleBoth")
+                    return root.t(p.defaultPuk ? "pin.pivStalePuk" : "pin.pivStaleMgmt")
                   }
                   color: root.urgent
                   font.family: root.fontFamily
@@ -895,11 +1203,11 @@ Item {
                   width: parent.width
                   section: "pin:openpgp"
                   icon: "󰌾"
-                  title: "Change the OpenPGP PIN"
-                  description: "Guards the GPG keys on the card. Default is 123456, with 12345678 as the admin PIN."
+                  title: root.t("pin.openpgpChange")
+                  description: root.t("pin.openpgpDesc")
                   trailing: {
                     var g = root.status.pins ? root.status.pins.openpgp : null
-                    return (g && g.retries) ? g.retries + " tries left" : ""
+                    return (g && g.retries) ? root.tn("pin.triesLeft", g.retries).arg(g.retries) : ""
                   }
                   enabledLook: !!(root.status.pins && root.status.pins.openpgp && root.status.pins.openpgp.present)
                   onActivated: root.runTerm(["pin", "openpgp"])
@@ -914,9 +1222,9 @@ Item {
                 spacing: Style.space(8)
                 visible: root.keyPresent
 
-                PanelSectionHeader { text: "Reset an applet"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("reset.title"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "Each of these wipes one applet back to factory state and cannot be undone. The terminal asks you to type the applet name before anything happens."
+                  text: root.t("reset.intro")
                   color: root.urgent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -931,10 +1239,10 @@ Item {
 
                   Repeater {
                     model: [
-                      { app: "fido2",   label: "Reset FIDO2",   note: "Drops every passkey and site registration" },
-                      { app: "piv",     label: "Reset PIV",     note: "Destroys all slot keypairs and certificates" },
-                      { app: "oath",    label: "Reset OATH",    note: "Destroys every stored TOTP account" },
-                      { app: "openpgp", label: "Reset OpenPGP", note: "Destroys the GPG keys on the card" }
+                      { app: "fido2",   label: root.t("reset.fido2"),   note: root.t("reset.fido2.note") },
+                      { app: "piv",     label: root.t("reset.piv"),     note: root.t("reset.piv.note") },
+                      { app: "oath",    label: root.t("reset.oath"),    note: root.t("reset.oath.note") },
+                      { app: "openpgp", label: root.t("reset.openpgp"), note: root.t("reset.openpgp.note") }
                     ]
                     delegate: ActionRow {
                       required property var modelData
@@ -962,9 +1270,9 @@ Item {
                 width: parent.width
                 spacing: Style.space(8)
 
-                PanelSectionHeader { text: "Logging into this machine"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("pam.title"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "PAM is the stack every password prompt on this machine goes through. Registering writes this key's public credential to " + root.pam.authfile + "; each switch below then adds one `sufficient` line to that prompt's stack, so a touch satisfies it and your password still works if the key is not around."
+                  text: root.t("pam.intro").arg(root.pam.authfile)
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -976,11 +1284,11 @@ Item {
                   width: parent.width
                   section: "pam-register"
                   icon: "󰌆"
-                  title: root.pam.registered ? "Register another key" : "Register this key with PAM"
+                  title: root.pam.registered ? root.t("pam.registerAnother") : root.t("pam.register")
                   description: root.pam.registered
-                    ? "Adds a second key to the same file — worth doing before you rely on the first one."
-                    : "Opens a terminal, asks for a touch, and writes the credential. Nothing below works until this is done."
-                  trailing: root.pam.keyCount > 0 ? root.pam.keyCount + " registered" : "None yet"
+                    ? root.t("pam.registerAnotherDesc")
+                    : root.t("pam.registerDesc")
+                  trailing: root.pam.keyCount > 0 ? root.tn("pam.registeredCount", root.pam.keyCount).arg(root.pam.keyCount) : root.t("pam.noneYet")
                   trailingColor: root.pam.registered ? root.accent : root.urgent
                   onActivated: root.runTerm(["pam-register"])
                 }
@@ -1003,22 +1311,22 @@ Item {
                     title: {
                       switch (modelData.service) {
                         case "sudo": return "sudo"
-                        case "polkit": return "Graphical privilege prompts"
-                        case "login": return "Console login"
-                        case "lock": return "Lock screen"
+                        case "polkit": return root.t("pam.polkit")
+                        case "login": return root.t("pam.login")
+                        case "lock": return root.t("pam.lock")
                         default: return modelData.service
                       }
                     }
                     description: {
                       switch (modelData.service) {
-                        case "sudo": return "Touch the key instead of typing your password at a sudo prompt."
-                        case "polkit": return "The dialog Omarchy raises when an app needs root. The file is created if it does not exist."
-                        case "login": return "The text logins on tty2–tty6. The graphical greeter has its own stack and is not covered."
-                        case "lock": return "Omarchy's lock screen. Note the trade: the stack asks for a touch before it checks the password, so unlocking without the key means waiting that prompt out first."
+                        case "sudo": return root.t("pam.sudoDesc")
+                        case "polkit": return root.t("pam.polkitDesc")
+                        case "login": return root.t("pam.loginDesc")
+                        case "lock": return root.t("pam.lockDesc")
                         default: return modelData.file
                       }
                     }
-                    trailing: modelData.enabled ? "On" : "Off"
+                    trailing: modelData.enabled ? root.t("state.on") : root.t("state.off")
                     trailingColor: modelData.enabled ? root.accent : root.dimmer
                     onActivated: root.togglePam(modelData.service)
                   }
@@ -1032,7 +1340,7 @@ Item {
 
                 PanelSectionHeader { text: "SSH"; foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "Three unrelated ways to put an SSH identity on the key, and a key can hold all three. FIDO2 is the simple one: OpenSSH speaks it directly, with no agent and no daemon."
+                  text: root.t("ssh.intro")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1041,7 +1349,7 @@ Item {
                 }
 
                 Text {
-                  text: "On the key"
+                  text: root.t("common.onKey")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.subtitle
@@ -1050,13 +1358,13 @@ Item {
 
                 Text {
                   text: {
-                    if (!root.keyPresent) return "Plug the key in to see what it holds."
+                    if (!root.keyPresent) return root.t("ssh.plugIn")
                     var parts = []
                     if (root.cardSshKeys.length === 0)
                       parts.push(root.sshKeys.piv && root.sshKeys.piv.readable
-                        ? "No PIV or OpenPGP SSH key on the key."
-                        : "The PIV applet could not be read — it needs pcscd and a PKCS#11 module.")
-                    parts.push("FIDO2 resident keys need the PIN to list, so they open in a terminal. Non-resident keys are not stored on the key at all.")
+                        ? root.t("ssh.noCardKey")
+                        : root.t("ssh.pivUnreadable"))
+                    parts.push(root.t("ssh.residentNote"))
                     return parts.join(" ")
                   }
                   color: root.dimmer
@@ -1075,7 +1383,7 @@ Item {
                     icon: "󰌆"
                     title: modelData.source + " · " + modelData.title
                     description: modelData.detail
-                    trailing: modelData.key ? "Copy" : "No public key"
+                    trailing: modelData.key ? root.t("ssh.copy") : root.t("ssh.noPublic")
                     trailingColor: modelData.key ? root.accent : root.dimmer
                     onActivated: root.copySshKey(modelData.id)
                   }
@@ -1085,16 +1393,16 @@ Item {
                   width: parent.width
                   section: "ssh-sk-list"
                   icon: "󰈙"
-                  title: "List resident FIDO2 SSH keys"
-                  description: "Asks for the FIDO2 PIN in a terminal and shows the SSH credentials stored on the key, separately from website passkeys."
+                  title: root.t("ssh.listResident")
+                  description: root.t("ssh.listResidentDesc")
                   trailing: (root.sshKeys.fido && root.sshKeys.fido.residentSlotsRemaining !== null && root.sshKeys.fido.residentSlotsRemaining !== undefined)
-                    ? root.sshKeys.fido.residentSlotsRemaining + " slots free" : ""
+                    ? root.tn("ssh.slotsFree", root.sshKeys.fido.residentSlotsRemaining).arg(root.sshKeys.fido.residentSlotsRemaining) : ""
                   enabledLook: root.keyPresent
                   onActivated: root.runTerm(["ssh-sk-list"])
                 }
 
                 Text {
-                  text: "Add a new one"
+                  text: root.t("ssh.addNew")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.subtitle
@@ -1105,9 +1413,9 @@ Item {
                   width: parent.width
                   section: "ssh-sk"
                   icon: "󰌘"
-                  title: "New resident SSH key (recommended)"
-                  description: "ed25519-sk stored on the key itself, protected by the FIDO2 PIN and a touch. Because it is resident, you can pull it back onto a new machine with nothing but the key."
-                  trailing: (root.ssh.skKeys && root.ssh.skKeys.length > 0) ? root.ssh.skKeys.length + " on disk" : ""
+                  title: root.t("ssh.newResident")
+                  description: root.t("ssh.newResidentDesc")
+                  trailing: (root.ssh.skKeys && root.ssh.skKeys.length > 0) ? root.tn("ssh.onDisk", root.ssh.skKeys.length).arg(root.ssh.skKeys.length) : ""
                   onActivated: root.runTerm(["ssh-sk", "ed25519-sk", "resident"])
                 }
 
@@ -1115,8 +1423,8 @@ Item {
                   width: parent.width
                   section: "ssh-sk-plain"
                   icon: "󰌘"
-                  title: "New non-resident SSH key"
-                  description: "Same touch requirement, but the handle lives only in ~/.ssh — lose the file and the key cannot recover it. Use this where a PIN prompt on every connection would be in the way."
+                  title: root.t("ssh.newPlain")
+                  description: root.t("ssh.newPlainDesc")
                   onActivated: root.runTerm(["ssh-sk", "ed25519-sk", "nonresident"])
                 }
 
@@ -1124,8 +1432,8 @@ Item {
                   width: parent.width
                   section: "ssh-recover"
                   icon: "󰃨"
-                  title: "Recover resident keys from the key"
-                  description: "Writes the key handles for every resident credential back into ~/.ssh. This is what you run on a machine that has never seen this YubiKey."
+                  title: root.t("ssh.recover")
+                  description: root.t("ssh.recoverDesc")
                   onActivated: root.runTerm(["ssh-recover"])
                 }
 
@@ -1133,11 +1441,11 @@ Item {
                   width: parent.width
                   section: "ssh-piv"
                   icon: "󰄀"
-                  title: "Use the PIV applet over PKCS#11"
+                  title: root.t("ssh.piv")
                   description: root.ssh.pkcs11Module.length > 0
-                    ? "Points OpenSSH at " + root.ssh.pkcs11Module + " so a keypair in a PIV slot can authenticate. Needs pcscd running."
-                    : "No PKCS#11 module is installed yet — Setup adds one."
-                  trailing: root.ssh.pkcs11InSshConfig ? "Configured" : ""
+                    ? root.t("ssh.pivDesc").arg(root.ssh.pkcs11Module)
+                    : root.t("ssh.noModule")
+                  trailing: root.ssh.pkcs11InSshConfig ? root.t("ssh.configured") : ""
                   trailingColor: root.accent
                   enabledLook: root.ssh.pkcs11Module.length > 0
                   onActivated: root.runTerm(["ssh-piv"])
@@ -1147,11 +1455,11 @@ Item {
                   width: parent.width
                   section: "gpg-ssh"
                   icon: "󰌾"
-                  title: "Use gpg-agent as the SSH agent"
-                  description: "Exposes an OpenPGP authentication subkey on the card as an SSH identity. Takes effect after logging out and back in, since it sets SSH_AUTH_SOCK for the session."
-                  trailing: root.ssh.gpgSshEnabled ? "On" : "Off"
+                  title: root.t("ssh.gpg")
+                  description: root.t("ssh.gpgDesc")
+                  trailing: root.ssh.gpgSshEnabled ? root.t("state.on") : root.t("state.off")
                   trailingColor: root.ssh.gpgSshEnabled ? root.accent : root.dimmer
-                  onActivated: root.run(["gpg-ssh", root.ssh.gpgSshEnabled ? "off" : "on"], "Switching gpg-agent SSH support")
+                  onActivated: root.run(["gpg-ssh", root.ssh.gpgSshEnabled ? "off" : "on"], root.t("busy.gpgSsh"))
                 }
               }
 
@@ -1161,23 +1469,22 @@ Item {
                 spacing: Style.space(8)
                 visible: root.luks.devices && root.luks.devices.length > 0
 
-                PanelSectionHeader { text: "Disk encryption"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("luks.title"); foreground: root.foreground; fontFamily: root.fontFamily }
 
                 ActionRow {
                   width: parent.width
                   section: "luks-enroll"
                   icon: "󰋊"
-                  title: "Unlock this disk with the key at boot"
+                  title: root.t("luks.enroll")
                   description: {
                     var d = (root.luks.devices && root.luks.devices.length > 0) ? root.luks.devices[0] : null
                     if (!d) return ""
-                    return "Enrolls the key as a FIDO2 unlock method for " + d.device
-                      + ". Your passphrase stays valid and remains the only way in if the key is lost — keep it."
+                    return root.t("luks.desc").arg(d.device)
                   }
                   trailing: {
                     var d = (root.luks.devices && root.luks.devices.length > 0) ? root.luks.devices[0] : null
                     if (!d) return ""
-                    return d.fido2Tokens > 0 ? "Enrolled" : ""
+                    return d.fido2Tokens > 0 ? root.t("luks.enrolled") : ""
                   }
                   trailingColor: root.accent
                   enabledLook: root.luks.hasCryptenroll
@@ -1191,8 +1498,8 @@ Item {
                 width: parent.width
                 section: "pam-forget"
                 icon: "󰩹"
-                title: "Undo everything on this page"
-                description: "Removes every registered credential and takes pam_u2f back out of all four stacks. SSH keys and disk enrollments are left alone — those are removed where they were made."
+                title: root.t("forget.title")
+                description: root.t("forget.desc")
                 trailingColor: root.urgent
                 onActivated: root.runTerm(["pam-forget"])
               }
@@ -1209,14 +1516,14 @@ Item {
                 spacing: Style.space(6)
 
                 Text {
-                  text: "Signing into your accounts"
+                  text: root.t("accounts.title")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.title
                   font.bold: true
                 }
                 Text {
-                  text: "There are two ways an account can use this key, and most providers offer both.\n\nAs a security key or passkey, the registration happens in the browser on the provider's own page — no desktop can do it for you, so the list further down goes straight to the right settings page for each one.\n\nAs an authenticator, the provider shows you a secret and the key stores it. That part lives here: codes are generated from the key itself, so they survive a reinstall and never sit in a phone app."
+                  text: root.t("accounts.intro")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -1230,20 +1537,20 @@ Item {
                 width: parent.width
                 spacing: Style.space(8)
 
-                PanelSectionHeader { text: "Add an authenticator account"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("oath.addTitle"); foreground: root.foreground; fontFamily: root.fontFamily }
 
                 ActionRow {
                   width: parent.width
                   section: "oath-scan"
                   icon: "󰐮"
-                  title: "Scan the QR code off the screen"
-                  description: "Drag a box around the QR code the provider is showing and the account is added from it. Far less error-prone than copying a base32 secret by hand."
+                  title: root.t("oath.scan")
+                  description: root.t("oath.scanDesc")
                   enabledLook: !root.oath.locked
                   onActivated: root.runTerm(["oath-scan"])
                 }
 
                 Text {
-                  text: "Or type it in — providers always offer the secret as text behind a “can't scan the code?” link."
+                  text: root.t("oath.typeIt")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1258,7 +1565,7 @@ Item {
                   TextField {
                     id: issuerField
                     width: (parent.width - Style.space(8)) * 0.4
-                    placeholderText: "Issuer (Google)"
+                    placeholderText: root.t("oath.issuer")
                     foreground: root.foreground
                     accent: root.accent
                     font.family: root.fontFamily
@@ -1271,7 +1578,7 @@ Item {
                   TextField {
                     id: nameField
                     width: (parent.width - Style.space(8)) * 0.6
-                    placeholderText: "Account (you@gmail.com)"
+                    placeholderText: root.t("oath.account")
                     foreground: root.foreground
                     accent: root.accent
                     font.family: root.fontFamily
@@ -1286,7 +1593,7 @@ Item {
                 TextField {
                   id: secretField
                   width: parent.width
-                  placeholderText: "Base32 secret from the provider"
+                  placeholderText: root.t("oath.secret")
                   password: true
                   foreground: root.foreground
                   accent: root.accent
@@ -1301,8 +1608,8 @@ Item {
 
                 Toggle {
                   width: parent.width
-                  label: "Require a touch for this account"
-                  description: "Reading a code then needs the key physically touched. Malware on this machine cannot pull codes in the background."
+                  label: root.t("oath.touch")
+                  description: root.t("oath.touchDesc")
                   foreground: root.foreground
                   accent: root.accent
                   fontFamily: root.fontFamily
@@ -1314,7 +1621,7 @@ Item {
                 }
 
                 Button {
-                  text: "Add to the key"
+                  text: root.t("oath.add")
                   iconText: "󰐕"
                   bordered: true
                   foreground: root.foreground
@@ -1332,14 +1639,14 @@ Item {
                 width: parent.width
                 spacing: Style.space(8)
 
-                PanelSectionHeader { text: "On the key"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("common.onKey"); foreground: root.foreground; fontFamily: root.fontFamily }
 
                 Text {
                   text: root.oath.locked
-                    ? "The OATH applet is password protected. Unlock it with `ykman oath access` in a terminal, then refresh."
+                    ? root.t("oath.locked")
                     : ((root.oath.accounts && root.oath.accounts.length > 0)
-                        ? "Pick one to put its current code on the clipboard — it is cleared after one paste. Click ✕ to remove an account."
-                        : "No accounts stored yet.")
+                        ? root.t("oath.pick")
+                        : root.t("oath.none"))
                   color: root.oath.locked ? root.urgent : root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1360,7 +1667,7 @@ Item {
                       icon: "󰥔"
                       title: modelData.name
                       description: modelData.issuer.length > 0 ? modelData.issuer : ""
-                      trailing: "Copy code"
+                      trailing: root.t("oath.copyCode")
                       onActivated: root.generateCode(modelData.id)
                     }
 
@@ -1371,7 +1678,7 @@ Item {
                       foreground: root.urgent
                       accent: root.urgent
                       fontFamily: root.fontFamily
-                      tooltipText: "Delete this account from the key"
+                      tooltipText: root.t("oath.deleteTip")
                       anchors.verticalCenter: parent.verticalCenter
                       onClicked: root.deleteAccount(modelData.id)
                     }
@@ -1384,9 +1691,9 @@ Item {
                 width: parent.width
                 spacing: Style.space(8)
 
-                PanelSectionHeader { text: "Register as a security key"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("prov.title"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "These open the page where each provider adds a security key or passkey. Have the key plugged in first — the browser asks for a touch partway through."
+                  text: root.t("prov.intro")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1402,8 +1709,8 @@ Item {
                     section: "prov:" + modelData.id
                     icon: modelData.icon
                     title: modelData.name
-                    description: modelData.note
-                    trailing: "Open ↗"
+                    description: root.t("provider." + modelData.id, modelData.note)
+                    trailing: root.t("prov.open")
                     onActivated: root.openUrl(modelData.url)
                   }
                 }
@@ -1416,21 +1723,224 @@ Item {
               spacing: Style.space(20)
               visible: root.tab === "setup"
 
+              // ---- security wizard ----------------------------------------
+              Column {
+                width: parent.width
+                spacing: Style.space(10)
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(12)
+
+                  Column {
+                    width: parent.width - wizRunButton.width - Style.space(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(3)
+
+                    Text {
+                      text: root.t("wiz.title")
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.title
+                      font.bold: true
+                    }
+                    Text {
+                      text: root.t("wiz.progress")
+                        .arg(root.wizardCount("essential", true)).arg(root.wizardCount("essential", false))
+                        .arg(root.wizardCount("recommended", true)).arg(root.wizardCount("recommended", false))
+                        .arg(root.wizardCount("optional", true)).arg(root.wizardCount("optional", false))
+                      color: root.essentialsDone ? root.accent : root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                    }
+                  }
+
+                  Button {
+                    id: wizRunButton
+                    text: root.checking ? root.t("wiz.checking") : root.t("wiz.run")
+                    iconText: "󰄵"
+                    bordered: true
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    hasCursor: root.focusSection === "wiz-run"
+                    anchors.verticalCenter: parent.verticalCenter
+                    onHovered: function(h) { if (h) root.focusSection = "wiz-run" }
+                    onClicked: { root.focusSection = "wiz-run"; root.reloadAll() }
+                  }
+                }
+
+                Text {
+                  text: root.t("wiz.intro")
+                  color: root.dimmer
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                }
+
+                // Progress across every step that applies.
+                Rectangle {
+                  width: parent.width
+                  height: 6
+                  radius: 3
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                  Rectangle {
+                    readonly property int total: root.wizardSteps.length
+                    readonly property int done: {
+                      var c = 0
+                      for (var i = 0; i < root.wizardSteps.length; i++) if (root.wizardSteps[i].state === "ok") c++
+                      return c
+                    }
+                    width: total > 0 ? parent.width * done / total : 0
+                    height: parent.height
+                    radius: parent.radius
+                    color: root.essentialsDone ? root.accent : root.urgent
+                    Behavior on width { NumberAnimation { duration: Style.duration(240); easing.type: Easing.OutCubic } }
+                  }
+                }
+
+                // ---- current step --------------------------------------
+                BorderSurface {
+                  width: parent.width
+                  implicitHeight: stepCol.implicitHeight + Style.spacing.rowPaddingX * 2
+                  radius: Style.cornerRadius
+                  readonly property var step: root.wizardCurrent
+                  readonly property color tint: !step ? root.accent : root.wizardStateColor(step)
+                  color: Qt.rgba(tint.r, tint.g, tint.b, 0.08)
+                  borderSpec: Border.flat(Qt.rgba(tint.r, tint.g, tint.b, 0.45), 1)
+
+                  Column {
+                    id: stepCol
+                    readonly property var step: parent.step
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(16)
+                    anchors.rightMargin: Style.space(16)
+                    spacing: Style.space(8)
+
+                    Text {
+                      text: stepCol.step
+                        ? root.t("wiz.step").arg(root.wizardCurrentIndex + 1).arg(root.wizardSteps.length)
+                          + "  ·  " + root.t("wiz." + stepCol.step.level) + "  ·  " + root.wizardStateLabel(stepCol.step)
+                        : root.t("wiz.state.ok")
+                      color: stepCol.step ? root.wizardStateColor(stepCol.step) : root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      text: stepCol.step ? stepCol.step.icon + "  " + stepCol.step.title : "󰄬  " + root.t("wiz.allDoneTitle")
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.heading
+                      font.bold: true
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                    }
+                    Text {
+                      text: stepCol.step ? stepCol.step.why : root.t("wiz.allDoneBody")
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                    }
+                    Text {
+                      text: stepCol.step ? stepCol.step.detail : ""
+                      visible: text.length > 0
+                      color: root.wizardStateColor(stepCol.step || { state: "ok" })
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                    }
+                    Text {
+                      text: root.t("wiz.terminalNote")
+                      visible: !!stepCol.step && stepCol.step.kind === "term" && stepCol.step.state !== "ok" && stepCol.step.state !== "blocked"
+                      color: root.dimmer
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Row {
+                      spacing: Style.space(8)
+                      visible: !!stepCol.step
+                      topPadding: Style.space(4)
+
+                      Button {
+                        text: stepCol.step ? stepCol.step.action : ""
+                        iconText: "󰐊"
+                        bordered: true
+                        visible: !!stepCol.step && stepCol.step.state !== "ok"
+                        opacity: stepCol.step && stepCol.step.state === "blocked" ? 0.45 : 1.0
+                        foreground: root.foreground
+                        accent: root.accent
+                        fontFamily: root.fontFamily
+                        hasCursor: root.focusSection === "wiz-do"
+                        onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(this)
+                        onHovered: function(h) { if (h) root.focusSection = "wiz-do" }
+                        onClicked: { root.focusSection = "wiz-do"; root.runWizardStep(stepCol.step) }
+                      }
+                      Button {
+                        text: stepCol.step && stepCol.step.skipped ? root.t("wiz.unskip") : root.t("wiz.skip")
+                        iconText: "󰒭"
+                        bordered: true
+                        visible: !!stepCol.step && stepCol.step.state !== "ok"
+                        foreground: root.foreground
+                        accent: root.accent
+                        fontFamily: root.fontFamily
+                        hasCursor: root.focusSection === "wiz-skip"
+                        onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(this)
+                        onHovered: function(h) { if (h) root.focusSection = "wiz-skip" }
+                        onClicked: { root.focusSection = "wiz-skip"; root.toggleSkip(stepCol.step.id) }
+                      }
+                    }
+                  }
+                }
+
+                // ---- checklist ----------------------------------------
+                Repeater {
+                  model: root.wizardSteps
+                  delegate: ActionRow {
+                    required property var modelData
+                    width: parent.width
+                    section: "wiz-step:" + modelData.id
+                    icon: root.wizardStateIcon(modelData)
+                    title: modelData.title
+                    description: modelData.detail
+                    trailing: root.t("wiz." + modelData.level) + " · " + root.wizardStateLabel(modelData)
+                    trailingColor: root.wizardStateColor(modelData)
+                    enabledLook: !modelData.skipped
+                    onActivated: root.selectStep(modelData.id)
+                    // Skipped rows stay clickable so a skip can be undone.
+                    TapHandler { enabled: modelData.skipped; onTapped: { root.focusSection = "wiz-step:" + modelData.id; root.selectStep(modelData.id) } }
+                  }
+                }
+              }
+
+              PanelSeparator { foreground: root.foreground }
+
               Column {
                 width: parent.width
                 spacing: Style.space(6)
 
                 Text {
                   text: root.deps.missing > 0
-                    ? root.deps.missing + " of " + (root.deps.deps ? root.deps.deps.length : 0) + " supporting packages are missing"
-                    : "Everything this plugin needs is installed"
+                    ? root.t("setup.missing").arg(root.deps.missing).arg(root.deps.deps ? root.deps.deps.length : 0)
+                    : root.t("setup.allInstalled")
                   color: root.deps.missing > 0 ? root.urgent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.title
                   font.bold: true
                 }
                 Text {
-                  text: "None of these ship with Omarchy. Each one backs a specific page here, so a missing package shows up as a page that cannot do its job rather than an error."
+                  text: root.t("setup.intro")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -1443,9 +1953,9 @@ Item {
                 width: parent.width
                 section: "install-deps"
                 icon: "󰏔"
-                title: root.deps.missing > 0 ? "Install what is missing" : "Re-check and repair"
-                description: "Opens a terminal, installs the packages through omarchy-pkg-add, and enables pcscd.socket. You will be asked for your password."
-                trailing: root.deps.missing > 0 ? root.deps.missing + " missing" : "All present"
+                title: root.deps.missing > 0 ? root.t("setup.install") : root.t("setup.repair")
+                description: root.t("setup.installDesc")
+                trailing: root.deps.missing > 0 ? root.t("setup.missingCount").arg(root.deps.missing) : root.t("setup.allPresent")
                 trailingColor: root.deps.missing > 0 ? root.urgent : root.accent
                 onActivated: root.runTerm(["install-deps"])
               }
@@ -1454,7 +1964,7 @@ Item {
                 width: parent.width
                 spacing: Style.space(6)
 
-                PanelSectionHeader { text: "Packages"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("setup.packages"); foreground: root.foreground; fontFamily: root.fontFamily }
 
                 Repeater {
                   model: root.deps.deps || []
@@ -1483,7 +1993,7 @@ Item {
                         font.pixelSize: Style.font.bodySmall
                       }
                       Text {
-                        text: modelData.why
+                        text: root.t("dep." + modelData.pkg, modelData.why)
                         color: root.dimmer
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -1501,11 +2011,11 @@ Item {
                 width: parent.width
                 spacing: Style.space(4)
 
-                PanelSectionHeader { text: "Smartcard daemon"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("setup.pcscd"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
                   text: root.deps.pcscdRunning
-                    ? "pcscd.socket is active. The PIV and OpenPGP applets are reachable."
-                    : "pcscd.socket is not active. The PIV and OpenPGP applets will not answer until it is — the install above enables it."
+                    ? root.t("setup.pcscdOn")
+                    : root.t("setup.pcscdOff")
                   color: root.deps.pcscdRunning ? root.dim : root.urgent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1518,9 +2028,9 @@ Item {
                 width: parent.width
                 spacing: Style.space(4)
 
-                PanelSectionHeader { text: "From a terminal"; foreground: root.foreground; fontFamily: root.fontFamily }
+                PanelSectionHeader { text: root.t("setup.terminal"); foreground: root.foreground; fontFamily: root.fontFamily }
                 Text {
-                  text: "Everything this panel does is a subcommand of the script it ships with. `omarchy-yubikey doctor` prints the whole picture, and `omarchy-yubikey --help` lists the rest."
+                  text: root.t("setup.terminalDesc")
                   color: root.dimmer
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1545,6 +2055,7 @@ Item {
         id: confirm
         anchors.fill: parent
         property var action: null
+        cancelText: root.t("confirm.cancel")
         background: root.background
         foreground: root.foreground
         fontFamily: root.fontFamily
